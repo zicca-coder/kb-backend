@@ -2,37 +2,64 @@ from typing import Annotated
 
 from fastapi import APIRouter, Query
 
-from app.api.dependencies import CurrentUser, UserAgentServiceDependency
+from app.api.dependencies import (
+    AgentProvisioningServiceDependency,
+    CurrentUser,
+    UserAgentServiceDependency,
+)
 from app.schemas.response import ApiResponse, success_response
 from app.schemas.user_agent import (
     UserAgentCreate,
     UserAgentList,
+    UserAgentPublicRead,
     UserAgentRead,
     UserAgentUpdate,
 )
 
-router = APIRouter(prefix="/user-agents", tags=["用户 Agent"])
+router = APIRouter(prefix="/user-agents", tags=["user agents"])
 current_user_router = APIRouter(
     prefix="/user-agents",
-    tags=["用户 Agent"],
+    tags=["user agents"],
 )
 
 
 @current_user_router.get(
     "/me",
-    response_model=ApiResponse[UserAgentRead],
+    response_model=ApiResponse[UserAgentPublicRead],
 )
 async def get_my_user_agent(
     current_user: CurrentUser,
     service: UserAgentServiceDependency,
-) -> ApiResponse[UserAgentRead]:
-    user_agent = UserAgentRead.model_validate(
+) -> ApiResponse[UserAgentPublicRead]:
+    user_agent = UserAgentPublicRead.model_validate(
         await service.get_by_user_id(current_user.id)
     )
     return success_response(
         data=user_agent,
-        detail="查询当前用户 Agent 成功",
+        detail="Get current user Agent succeeded",
     )
+
+
+@current_user_router.post(
+    "/me/provision",
+    response_model=ApiResponse[UserAgentPublicRead],
+)
+async def provision_my_user_agent(
+    current_user: CurrentUser,
+    service: AgentProvisioningServiceDependency,
+) -> ApiResponse[UserAgentPublicRead]:
+    user_agent = UserAgentPublicRead.model_validate(
+        await service.provision_for_user(
+            user_id=current_user.id,
+            manual_retry=True,
+        )
+    )
+    detail = (
+        "Agent provisioning completed"
+        if user_agent.provision_status != "failed"
+        else "Agent provisioning failed"
+    )
+    return success_response(data=user_agent, detail=detail)
 
 
 @router.post(
@@ -43,10 +70,11 @@ async def create_user_agent(
     data: UserAgentCreate,
     service: UserAgentServiceDependency,
 ) -> ApiResponse[UserAgentRead]:
-    user_agent = UserAgentRead.model_validate(
-        await service.create(data)
+    user_agent = UserAgentRead.model_validate(await service.create(data))
+    return success_response(
+        data=user_agent,
+        detail="Create user Agent succeeded",
     )
-    return success_response(data=user_agent, detail="新增用户 Agent 成功")
 
 
 @router.get("", response_model=ApiResponse[UserAgentList])
@@ -70,7 +98,7 @@ async def list_user_agents(
     )
     return success_response(
         data=result,
-        detail="查询用户 Agent 列表成功",
+        detail="List user Agents succeeded",
     )
 
 
@@ -87,7 +115,7 @@ async def get_user_agent(
     )
     return success_response(
         data=user_agent,
-        detail="查询用户 Agent 详情成功",
+        detail="Get user Agent succeeded",
     )
 
 
@@ -105,7 +133,7 @@ async def update_user_agent(
     )
     return success_response(
         data=user_agent,
-        detail="更新用户 Agent 成功",
+        detail="Update user Agent succeeded",
     )
 
 
@@ -118,4 +146,4 @@ async def delete_user_agent(
     service: UserAgentServiceDependency,
 ) -> ApiResponse[dict[str, object]]:
     await service.delete(user_agent_id)
-    return success_response(data={}, detail="删除用户 Agent 成功")
+    return success_response(data={}, detail="Delete user Agent succeeded")

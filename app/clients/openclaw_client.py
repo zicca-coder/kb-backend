@@ -76,6 +76,22 @@ class OpenClawClient:
                 "OpenClaw Gateway request failed",
             ) from exc
 
+        if response.status_code == 409:
+            result = self._parse_conflict_response(response)
+            if result is None:
+                self._raise_for_status(
+                    response.status_code,
+                    external_user_id=normalized_user_id,
+                )
+                raise AssertionError("unreachable")
+            logger.info(
+                "OpenClaw Agent already exists, external_user_id=%s, "
+                "agent_id=%s",
+                normalized_user_id,
+                result.agent_id,
+            )
+            return result
+
         self._raise_for_status(
             response.status_code,
             external_user_id=normalized_user_id,
@@ -208,3 +224,13 @@ class OpenClawClient:
             raise OpenClawResponseError(
                 "OpenClaw returned an invalid response format",
             ) from exc
+
+    @classmethod
+    def _parse_conflict_response(
+        cls,
+        response: httpx.Response,
+    ) -> AgentProvisionResult | None:
+        try:
+            return cls._parse_success_response(response)
+        except OpenClawResponseError:
+            return None

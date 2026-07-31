@@ -21,6 +21,8 @@ os.environ.setdefault(
 
 from app.core.database import get_db  # noqa: E402
 from app.main import create_app  # noqa: E402
+from app.api.dependencies import get_openclaw_client  # noqa: E402
+from app.schemas.openclaw import AgentProvisionResult  # noqa: E402
 
 TEST_SCHEMA = """
 CREATE TABLE users (
@@ -45,7 +47,7 @@ CREATE TABLE user_agents (
     agent_id VARCHAR(128) UNIQUE,
     runtime_type VARCHAR(32) NOT NULL DEFAULT 'shared',
     runtime_id VARCHAR(255),
-    provision_status VARCHAR(32) NOT NULL DEFAULT 'creating',
+    provision_status VARCHAR(32) NOT NULL DEFAULT 'pending',
     provision_error VARCHAR(1000),
     is_deleted BOOLEAN NOT NULL DEFAULT 0,
     created_by VARCHAR(64) NOT NULL,
@@ -128,8 +130,14 @@ def db_session(
 
 
 @pytest.fixture
+def openclaw_calls() -> list[str]:
+    return []
+
+
+@pytest.fixture
 def client(
     async_session_factory: async_sessionmaker[AsyncSession],
+    openclaw_calls: list[str],
 ) -> Generator[TestClient, None, None]:
     application = create_app()
 
@@ -137,7 +145,22 @@ def client(
         async with async_session_factory() as session:
             yield session
 
+    class FakeOpenClawClient:
+        async def provision_agent(
+            self,
+            *,
+            external_user_id: int | str,
+        ) -> AgentProvisionResult:
+            normalized = str(external_user_id)
+            openclaw_calls.append(normalized)
+            return AgentProvisionResult(
+                agent_id=f"web-user-{normalized}",
+            )
+
     application.dependency_overrides[get_db] = override_get_db
+    application.dependency_overrides[get_openclaw_client] = (
+        lambda: FakeOpenClawClient()
+    )
     with TestClient(application) as test_client:
         yield test_client
     application.dependency_overrides.clear()

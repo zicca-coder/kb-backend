@@ -1,6 +1,7 @@
 from sqlalchemy import BigInteger, ForeignKey, String, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
+from app.core.provisioning import ProvisionStatus
 from app.models.base import Base
 from app.models.mixins import AuditMixin, BigIntIdMixin, SoftDeleteMixin
 
@@ -67,8 +68,8 @@ class UserAgent(
     provision_status: Mapped[str] = mapped_column(
         String(32),
         nullable=False,
-        default="creating",
-        server_default="creating",
+        default=ProvisionStatus.PENDING.value,
+        server_default=ProvisionStatus.PENDING.value,
         comment="Agent provisioning status",
     )
 

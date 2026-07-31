@@ -4,26 +4,40 @@ from app.api.dependencies import AuthServiceDependency, CurrentUser
 from app.schemas.auth import (
     CurrentUserResponse,
     LoginResponse,
+    RegisterResponse,
     UserLoginRequest,
     UserRegisterRequest,
 )
 from app.schemas.response import ApiResponse, success_response
 
-router = APIRouter(prefix="/auth", tags=["认证"])
+router = APIRouter(prefix="/auth", tags=["auth"])
 
 
 @router.post(
     "/register",
-    response_model=ApiResponse[CurrentUserResponse],
+    response_model=ApiResponse[RegisterResponse],
 )
 async def register(
     request: UserRegisterRequest,
     service: AuthServiceDependency,
-) -> ApiResponse[CurrentUserResponse]:
-    user = CurrentUserResponse.model_validate(
-        await service.register(request)
+) -> ApiResponse[RegisterResponse]:
+    result = await service.register(request)
+    user = CurrentUserResponse.model_validate(result.user)
+    response = RegisterResponse(
+        **user.model_dump(),
+        user=user,
+        agent={
+            "agent_id": result.user_agent.agent_id,
+            "provision_status": result.user_agent.provision_status,
+            "provision_error": result.user_agent.provision_error,
+        },
     )
-    return success_response(data=user, detail="注册成功")
+    detail = (
+        "Register succeeded"
+        if result.user_agent.provision_status != "failed"
+        else "Register succeeded, Agent provisioning failed"
+    )
+    return success_response(data=response, detail=detail)
 
 
 @router.post(
@@ -40,7 +54,7 @@ async def login(
         expires_in=result.expires_in,
         user=CurrentUserResponse.model_validate(result.user),
     )
-    return success_response(data=response, detail="登录成功")
+    return success_response(data=response, detail="Login succeeded")
 
 
 @router.get(
@@ -51,4 +65,4 @@ async def get_me(
     current_user: CurrentUser,
 ) -> ApiResponse[CurrentUserResponse]:
     user = CurrentUserResponse.model_validate(current_user)
-    return success_response(data=user, detail="获取当前用户成功")
+    return success_response(data=user, detail="Get current user succeeded")

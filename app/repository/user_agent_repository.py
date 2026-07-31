@@ -38,6 +38,19 @@ class UserAgentRepository:
         result = await self.db.execute(statement)
         return result.scalar_one_or_none()
 
+    async def get_by_user_id_for_update(
+        self,
+        user_id: int,
+        *,
+        include_deleted: bool = False,
+    ) -> UserAgent | None:
+        statement = select(UserAgent).where(UserAgent.user_id == user_id)
+        if not include_deleted:
+            statement = statement.where(UserAgent.is_deleted.is_(False))
+        statement = statement.with_for_update()
+        result = await self.db.execute(statement)
+        return result.scalar_one_or_none()
+
     async def get_by_agent_id(
         self,
         agent_id: str,

@@ -6,22 +6,63 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.clients.openclaw_client import OpenClawClient
 from app.core.database import get_db
-from app.core.errors import AuthenticationError
+from app.core.errors import AuthenticationError, OpenClawConfigurationError
 from app.core.snowflake import get_snowflake_generator
 from app.core.settings import settings
 from app.core.security import TokenValidationError, decode_access_token
 from app.models.user import User
 from app.repository.user_repository import UserRepository
+from app.services.agent_provision_service import (
+    AgentProvisionClient,
+    AgentProvisioningService,
+)
 from app.services.auth_service import AuthService
 from app.services.user_agent_service import UserAgentService
 from app.services.user_service import UserService
+from app.schemas.openclaw import AgentProvisionResult
 
 DatabaseDependency = Annotated[AsyncSession, Depends(get_db)]
 bearer_scheme = HTTPBearer(auto_error=False)
 
 
-async def get_auth_service(db: DatabaseDependency) -> AuthService:
-    return AuthService(db, snowflake_generator=get_snowflake_generator())
+class UnavailableOpenClawClient:
+    def __init__(self, message: str) -> None:
+        self.message = message
+
+    async def provision_agent(
+        self,
+        *,
+        external_user_id: int | str,
+    ) -> AgentProvisionResult:
+        raise OpenClawConfigurationError(self.message)
+
+
+def get_openclaw_client() -> AgentProvisionClient:
+    try:
+        return OpenClawClient(
+            base_url=settings.openclaw_base_url,
+            gateway_token=settings.openclaw_gateway_token.get_secret_value(),
+            timeout_seconds=settings.openclaw_timeout_seconds,
+        )
+    except OpenClawConfigurationError as exc:
+        return UnavailableOpenClawClient(str(exc))
+
+
+OpenClawClientDependency = Annotated[
+    AgentProvisionClient,
+    Depends(get_openclaw_client),
+]
+
+
+async def get_auth_service(
+    db: DatabaseDependency,
+    openclaw_client: OpenClawClientDependency,
+) -> AuthService:
+    return AuthService(
+        db,
+        snowflake_generator=get_snowflake_generator(),
+        openclaw_client=openclaw_client,
+    )
 
 
 AuthServiceDependency = Annotated[
@@ -52,17 +93,16 @@ UserAgentServiceDependency = Annotated[
 ]
 
 
-def get_openclaw_client() -> OpenClawClient:
-    return OpenClawClient(
-        base_url=settings.openclaw_base_url,
-        gateway_token=settings.openclaw_gateway_token.get_secret_value(),
-        timeout_seconds=settings.openclaw_timeout_seconds,
-    )
+async def get_agent_provisioning_service(
+    db: DatabaseDependency,
+    openclaw_client: OpenClawClientDependency,
+) -> AgentProvisioningService:
+    return AgentProvisioningService(db, openclaw_client)
 
 
-OpenClawClientDependency = Annotated[
-    OpenClawClient,
-    Depends(get_openclaw_client),
+AgentProvisioningServiceDependency = Annotated[
+    AgentProvisioningService,
+    Depends(get_agent_provisioning_service),
 ]
 
 
@@ -113,6 +153,7 @@ __all__ = [
     "AuthServiceDependency",
     "CurrentUser",
     "DatabaseDependency",
+    "AgentProvisioningServiceDependency",
     "OpenClawClientDependency",
     "UserAgentServiceDependency",
     "UserServiceDependency",

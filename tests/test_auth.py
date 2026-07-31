@@ -53,6 +53,7 @@ def _login(
 def test_register_hashes_password_and_hides_sensitive_fields(
     client: TestClient,
     db_session: Session,
+    openclaw_calls: list[str],
 ) -> None:
     created = _register(client)
 
@@ -64,6 +65,8 @@ def test_register_hashes_password_and_hides_sensitive_fields(
     assert int(created["id"]) > JS_SAFE_INTEGER_MAX
     assert "password" not in created
     assert "password_hash" not in created
+    assert created["agent"]["agent_id"] == f"web-user-{created['id']}"
+    assert created["agent"]["provision_status"] == "ready"
 
     user = db_session.execute(
         select(User).where(User.id == int(created["id"]))
@@ -79,8 +82,10 @@ def test_register_hashes_password_and_hides_sensitive_fields(
     ).scalars().all()
     assert len(user_agents) == 1
     assert user_agents[0].user_id == user.id
-    assert user_agents[0].provision_status == "pending"
-    assert user_agents[0].agent_id is None
+    assert user_agents[0].provision_status == "ready"
+    assert user_agents[0].agent_id == f"web-user-{created['id']}"
+    assert user_agents[0].provision_error is None
+    assert openclaw_calls == [created["id"]]
 
 
 def test_register_rejects_duplicate_username_and_phone(
@@ -119,6 +124,7 @@ def test_register_rejects_duplicate_username_and_phone(
 def test_register_generates_unique_snowflake_id_and_reuses_it_for_user_agent(
     client: TestClient,
     db_session: Session,
+    openclaw_calls: list[str],
 ) -> None:
     first = _register(
         client,
@@ -141,6 +147,8 @@ def test_register_generates_unique_snowflake_id_and_reuses_it_for_user_agent(
         select(UserAgent).where(UserAgent.user_id == first_user.id)
     ).scalar_one()
     assert first_agent.user_id == first_user.id
+    assert first_agent.agent_id == f"web-user-{first['id']}"
+    assert openclaw_calls == [first["id"], second["id"]]
 
 
 def test_register_rolls_back_user_when_user_agent_creation_fails(

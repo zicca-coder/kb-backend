@@ -10,6 +10,10 @@ from pydantic import (
 )
 
 from app.schemas.ids import SnowflakeId
+from app.core.provisioning import (
+    SAFE_PUBLIC_PROVISION_ERROR,
+    ProvisionStatus,
+)
 
 AgentId = Annotated[
     str,
@@ -24,7 +28,6 @@ ProvisionError = Annotated[
     StringConstraints(strip_whitespace=True, min_length=1, max_length=1000),
 ]
 RuntimeType = Literal["shared", "container", "os_user"]
-ProvisionStatus = Literal["pending", "creating", "ready", "failed"]
 
 
 class UserAgentCreate(BaseModel):
@@ -34,7 +37,7 @@ class UserAgentCreate(BaseModel):
     agent_id: AgentId | None = None
     runtime_type: RuntimeType = "shared"
     runtime_id: RuntimeId | None = None
-    provision_status: ProvisionStatus = "creating"
+    provision_status: ProvisionStatus = ProvisionStatus.PENDING
     provision_error: ProvisionError | None = None
 
 
@@ -80,6 +83,49 @@ class UserAgentRead(BaseModel):
     created_at: datetime
     updated_by: str
     updated_at: datetime
+
+
+class UserAgentPublicRead(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    user_id: SnowflakeId
+    agent_id: str | None
+    runtime_type: RuntimeType
+    runtime_id: str | None
+    provision_status: ProvisionStatus
+    provision_error: str | None
+    is_deleted: bool
+    created_by: str
+    created_at: datetime
+    updated_by: str
+    updated_at: datetime
+
+    @model_validator(mode="after")
+    def hide_internal_provision_error(self) -> "UserAgentPublicRead":
+        if (
+            self.provision_status == ProvisionStatus.FAILED
+            and self.provision_error is not None
+        ):
+            self.provision_error = SAFE_PUBLIC_PROVISION_ERROR
+        return self
+
+
+class UserAgentProvisionSummary(BaseModel):
+    agent_id: str | None
+    provision_status: ProvisionStatus
+    provision_error: str | None = None
+
+    @model_validator(mode="after")
+    def hide_internal_provision_error(
+        self,
+    ) -> "UserAgentProvisionSummary":
+        if (
+            self.provision_status == ProvisionStatus.FAILED
+            and self.provision_error is not None
+        ):
+            self.provision_error = SAFE_PUBLIC_PROVISION_ERROR
+        return self
 
 
 class UserAgentList(BaseModel):

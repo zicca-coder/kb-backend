@@ -5,6 +5,7 @@ from pydantic import BaseModel, ConfigDict, EmailStr, StringConstraints
 
 from app.schemas.ids import SnowflakeId
 from app.schemas.user import DisplayName, Phone, Username
+from app.schemas.user_agent import UserAgentProvisionSummary
 
 Password = Annotated[
     str,
@@ -66,3 +67,10 @@ class LoginResponse(TokenResponse):
     """登录成功响应。"""
 
     user: CurrentUserResponse
+
+
+class RegisterResponse(CurrentUserResponse):
+    """Registration response with the user's Agent provisioning state."""
+
+    user: CurrentUserResponse
+    agent: UserAgentProvisionSummary

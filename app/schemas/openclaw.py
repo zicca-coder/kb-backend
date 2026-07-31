@@ -9,6 +9,6 @@ AgentId = Annotated[
 
 
 class AgentProvisionResult(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="ignore")
 
     agent_id: AgentId

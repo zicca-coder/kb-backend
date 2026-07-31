@@ -2,7 +2,7 @@ import logging
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 
 from app.api.api_router import api_router
 from app.core.database import engine
@@ -40,3 +40,16 @@ def create_app() -> FastAPI:
 
 
 app = create_app()
+
+@app.middleware("http")
+async def add_utf8_charset(request: Request, call_next):
+    response = await call_next(request)
+
+    content_type = response.headers.get("content-type", "")
+    if (
+        content_type.startswith("application/json")
+        and "charset=" not in content_type.lower()
+    ):
+        response.headers["content-type"] = "application/json; charset=utf-8"
+
+    return response

@@ -6,6 +6,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from starlette.concurrency import run_in_threadpool
 
 from app.core.errors import AuthenticationError, ResourceConflictError
+from app.core.provisioning import ProvisionStatus
 from app.core.security import (
     create_access_token,
     hash_password,
@@ -16,6 +17,10 @@ from app.models.user import User
 from app.models.user_agent import UserAgent
 from app.repository.user_agent_repository import UserAgentRepository
 from app.repository.user_repository import UserRepository
+from app.services.agent_provision_service import (
+    AgentProvisionClient,
+    AgentProvisioningService,
+)
 from app.schemas.auth import UserLoginRequest, UserRegisterRequest
 
 
@@ -24,6 +29,12 @@ class LoginResult:
     access_token: str
     expires_in: int
     user: User
+
+
+@dataclass(frozen=True, slots=True)
+class RegisterResult:
+    user: User
+    user_agent: UserAgent
 
 
 class AuthService:
@@ -35,6 +46,7 @@ class AuthService:
         repository: UserRepository | None = None,
         user_agent_repository: UserAgentRepository | None = None,
         snowflake_generator: SnowflakeGenerator | None = None,
+        openclaw_client: AgentProvisionClient | None = None,
     ) -> None:
         self.db = db
         self.repository = repository or UserRepository(db)
@@ -44,6 +56,7 @@ class AuthService:
         self.snowflake_generator = (
             snowflake_generator or get_snowflake_generator()
         )
+        self.openclaw_client = openclaw_client
 
     @staticmethod
     def _normalize_username(username: str) -> str:
@@ -123,7 +136,7 @@ class AuthService:
             message="用户名或手机号已存在",
         ) from exc
 
-    async def register(self, request: UserRegisterRequest) -> User:
+    async def register(self, request: UserRegisterRequest) -> RegisterResult:
         username = self._normalize_username(request.username)
         phone = self._normalize_phone(request.phone)
         email = self._normalize_email(
@@ -157,7 +170,7 @@ class AuthService:
             user_agent = UserAgent(
                 user_id=user.id,
                 agent_id=None,
-                provision_status="pending",
+                provision_status=ProvisionStatus.PENDING.value,
                 is_deleted=False,
             )
             await self.user_agent_repository.create(user_agent)
@@ -175,7 +188,15 @@ class AuthService:
                 await self.db.rollback()
             raise
 
-        return user
+        if self.openclaw_client is None:
+            return RegisterResult(user=user, user_agent=user_agent)
+
+        provisioned_user_agent = await AgentProvisioningService(
+            self.db,
+            self.openclaw_client,
+        ).provision_for_user(user_id=user.id)
+
+        return RegisterResult(user=user, user_agent=provisioned_user_agent)
 
     async def authenticate(
         self,

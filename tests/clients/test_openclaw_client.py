@@ -102,6 +102,53 @@ def test_provision_agent_request_format_preserves_large_id() -> None:
     assert set(body) == {"external_user_id"}
 
 
+def test_provision_agent_treats_conflict_with_agent_id_as_success() -> None:
+    async def scenario() -> AgentProvisionResult:
+        async with make_async_client(
+            lambda _request: httpx.Response(
+                409,
+                json=provision_response(),
+            ),
+        ) as http_client:
+            return await make_openclaw_client(http_client).provision_agent(
+                external_user_id=SNOWFLAKE_ID,
+            )
+
+    result = run_async(scenario())
+
+    assert result.agent_id == f"web-user-{SNOWFLAKE_ID}"
+
+
+def test_provision_agent_ignores_extra_openclaw_response_fields() -> None:
+    async def scenario() -> AgentProvisionResult:
+        async with make_async_client(
+            lambda _request: httpx.Response(
+                200,
+                json={
+                    "created": False,
+                    "agent_id": f"web-user-{SNOWFLAKE_ID}",
+                    "workspace_path": "/sensitive/workspace",
+                    "agent_dir": "/sensitive/agent",
+                    "workspace_created": False,
+                    "agent_dir_created": False,
+                    "agent_registered": False,
+                    "template_files": [
+                        {"file_name": "AGENTS.md", "status": "skipped"},
+                    ],
+                },
+            ),
+        ) as http_client:
+            return await make_openclaw_client(http_client).provision_agent(
+                external_user_id=SNOWFLAKE_ID,
+            )
+
+    result = run_async(scenario())
+
+    assert result.agent_id == f"web-user-{SNOWFLAKE_ID}"
+    assert not hasattr(result, "workspace_path")
+    assert not hasattr(result, "agent_dir")
+
+
 @pytest.mark.parametrize(
     ("status_code", "expected_error"),
     [
@@ -128,6 +175,22 @@ def test_provision_agent_maps_http_errors(
             with pytest.raises(expected_error) as exc_info:
                 await client.provision_agent(external_user_id=SNOWFLAKE_ID)
             assert TEST_TOKEN not in str(exc_info.value)
+
+    run_async(scenario())
+
+
+@pytest.mark.parametrize("response", [{}, {"agent_id": None}, {"detail": "exists"}])
+def test_provision_agent_conflict_without_agent_id_remains_conflict(
+    response: dict[str, object],
+) -> None:
+    async def scenario() -> None:
+        async with make_async_client(
+            lambda _request: httpx.Response(409, json=response),
+        ) as http_client:
+            with pytest.raises(OpenClawConflictError):
+                await make_openclaw_client(http_client).provision_agent(
+                    external_user_id=SNOWFLAKE_ID,
+                )
 
     run_async(scenario())
 
