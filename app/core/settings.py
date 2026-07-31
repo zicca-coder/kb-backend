@@ -29,7 +29,10 @@ class Settings(BaseSettings):
 
     openclaw_base_url: str = "http://127.0.0.1:18789"
     openclaw_gateway_token: SecretStr = SecretStr("")
-    openclaw_timeout_seconds: float = Field(default=20, gt=0)
+    openclaw_connect_timeout_seconds: float = Field(default=10, gt=0)
+    openclaw_read_timeout_seconds: float = Field(default=120, gt=0)
+    openclaw_write_timeout_seconds: float = Field(default=30, gt=0)
+    openclaw_pool_timeout_seconds: float = Field(default=10, gt=0)
 
     snowflake_worker_id: int = Field(default=1, ge=0, le=1023)
     snowflake_epoch_ms: int = Field(default=1767225600000, gt=0)

@@ -67,6 +67,8 @@ def test_register_hashes_password_and_hides_sensitive_fields(
     assert "password_hash" not in created
     assert created["agent"]["agent_id"] == f"web-user-{created['id']}"
     assert created["agent"]["provision_status"] == "ready"
+    assert created["agent"]["agent_ready"] is True
+    assert created["agent"]["retry_after_ms"] is None
 
     user = db_session.execute(
         select(User).where(User.id == int(created["id"]))

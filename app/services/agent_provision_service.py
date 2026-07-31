@@ -19,7 +19,10 @@ from app.core.errors import (
 from app.core.provisioning import ProvisionStatus
 from app.models.user_agent import UserAgent
 from app.repository.user_agent_repository import UserAgentRepository
-from app.schemas.openclaw import AgentProvisionResult
+from app.schemas.openclaw import (
+    AgentProvisionResult,
+    AgentRuntimeEnsureReadyResult,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -34,10 +37,17 @@ class AgentProvisionClient(Protocol):
     ) -> AgentProvisionResult:
         ...
 
+    async def ensure_agent_runtime_ready(
+        self,
+        *,
+        agent_id: str,
+    ) -> AgentRuntimeEnsureReadyResult:
+        ...
+
 
 def sanitize_openclaw_error(exc: BaseException) -> str:
     if isinstance(exc, OpenClawTimeoutError):
-        return "OpenClaw request timed out"
+        return "Backend timed out while waiting for OpenClaw"
     if isinstance(exc, OpenClawConnectionError):
         return "OpenClaw connection failed"
     if isinstance(exc, OpenClawAuthenticationError):
@@ -96,7 +106,11 @@ class AgentProvisioningService:
                 manual_retry,
             )
 
-            if current_status == ProvisionStatus.READY:
+            if current_status in (
+                ProvisionStatus.REGISTERED,
+                ProvisionStatus.WARMING,
+                ProvisionStatus.READY,
+            ):
                 await self.db.commit()
                 return user_agent, False
 
@@ -130,7 +144,8 @@ class AgentProvisioningService:
         self,
         *,
         user_id: int,
-        agent_id: str,
+        result: AgentProvisionResult,
+        readiness: AgentRuntimeEnsureReadyResult | None,
     ) -> UserAgent:
         try:
             user_agent = await self.repository.get_by_user_id_for_update(
@@ -142,16 +157,33 @@ class AgentProvisioningService:
                     message="User agent not found",
                 )
 
-            user_agent.agent_id = agent_id
-            user_agent.provision_status = ProvisionStatus.READY.value
-            user_agent.provision_error = None
+            user_agent.agent_id = result.agent_id
+            status_value = result.provision_status
+            provision_error = None
+            if readiness is not None:
+                if readiness.ready:
+                    status_value = ProvisionStatus.READY
+                else:
+                    status_value = self._readiness_status(
+                        readiness.reason or readiness.error,
+                    )
+                    provision_error = (
+                        readiness.reason
+                        or readiness.error
+                        or "runtime_owner_not_ready"
+                    )
+            user_agent.provision_status = status_value.value
+            user_agent.provision_error = provision_error
             user_agent.updated_by = SYSTEM_ACTOR
             await self.db.commit()
             await self.db.refresh(user_agent)
             logger.info(
-                "Agent provisioning succeeded, user_id=%s, agent_id=%s",
+                "Agent provisioning succeeded, user_id=%s, agent_id=%s, "
+                "status=%s, agent_ready=%s",
                 user_id,
-                agent_id,
+                result.agent_id,
+                user_agent.provision_status,
+                result.agent_ready,
             )
             return user_agent
         except IntegrityError:
@@ -199,6 +231,55 @@ class AgentProvisioningService:
                 await self.db.rollback()
             raise
 
+    @staticmethod
+    def _readiness_status(value: str | None) -> ProvisionStatus:
+        if value is None:
+            return ProvisionStatus.WARMING
+        try:
+            status_value = ProvisionStatus(value)
+        except ValueError:
+            return ProvisionStatus.WARMING
+        if status_value == ProvisionStatus.READY:
+            return ProvisionStatus.READY
+        if status_value in (
+            ProvisionStatus.REGISTERED,
+            ProvisionStatus.WARMING,
+        ):
+            return status_value
+        return ProvisionStatus.WARMING
+
+    async def _warm_up_runtime(
+        self,
+        *,
+        user_id: int,
+        agent_id: str,
+    ) -> AgentRuntimeEnsureReadyResult | None:
+        try:
+            readiness = await self.openclaw_client.ensure_agent_runtime_ready(
+                agent_id=agent_id,
+            )
+        except OpenClawError as exc:
+            logger.warning(
+                "OpenClaw Agent runtime warm-up failed after provisioning, "
+                "user_id=%s, agent_id=%s, error_type=%s",
+                user_id,
+                agent_id,
+                type(exc).__name__,
+            )
+            return None
+        logger.info(
+            "OpenClaw Agent runtime warm-up checked after provisioning, "
+            "user_id=%s, agent_id=%s, ready=%s, refreshed=%s, reason=%s, "
+            "error=%s",
+            user_id,
+            agent_id,
+            readiness.ready,
+            readiness.refreshed,
+            readiness.reason,
+            readiness.error,
+        )
+        return readiness
+
     async def provision_for_user(
         self,
         *,
@@ -223,7 +304,12 @@ class AgentProvisioningService:
                 error_message=error_message,
             )
 
-        return await self._finish_success(
+        readiness = await self._warm_up_runtime(
             user_id=user_id,
             agent_id=result.agent_id,
+        )
+        return await self._finish_success(
+            user_id=user_id,
+            result=result,
+            readiness=readiness,
         )

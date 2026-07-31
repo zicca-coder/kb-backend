@@ -22,7 +22,10 @@ os.environ.setdefault(
 from app.core.database import get_db  # noqa: E402
 from app.main import create_app  # noqa: E402
 from app.api.dependencies import get_openclaw_client  # noqa: E402
-from app.schemas.openclaw import AgentProvisionResult  # noqa: E402
+from app.schemas.openclaw import (  # noqa: E402
+    AgentProvisionResult,
+    AgentRuntimeEnsureReadyResult,
+)
 
 TEST_SCHEMA = """
 CREATE TABLE users (
@@ -155,6 +158,19 @@ def client(
             openclaw_calls.append(normalized)
             return AgentProvisionResult(
                 agent_id=f"web-user-{normalized}",
+            )
+
+        async def ensure_agent_runtime_ready(
+            self,
+            *,
+            agent_id: str,
+        ) -> AgentRuntimeEnsureReadyResult:
+            return AgentRuntimeEnsureReadyResult(
+                ok=True,
+                agentId=agent_id,
+                ready=True,
+                refreshed=True,
+                retryAfterMs=0,
             )
 
     application.dependency_overrides[get_db] = override_get_db

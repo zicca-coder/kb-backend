@@ -7,7 +7,13 @@ from typing import TypeVar
 import httpx
 import pytest
 
-from app.clients.openclaw_client import OpenClawClient, PROVISION_PATH
+from app.clients.openclaw_client import (
+    ADMIN_RPC_PATH,
+    CHAT_COMPLETIONS_PATH,
+    ENSURE_AGENT_RUNTIME_READY_METHOD,
+    OpenClawClient,
+    PROVISION_PATH,
+)
 from app.core.errors import (
     OpenClawAuthenticationError,
     OpenClawConfigurationError,
@@ -15,9 +21,13 @@ from app.core.errors import (
     OpenClawConnectionError,
     OpenClawRequestError,
     OpenClawResponseError,
+    OpenClawRuntimeNotReadyError,
     OpenClawTimeoutError,
 )
-from app.schemas.openclaw import AgentProvisionResult
+from app.schemas.openclaw import (
+    AgentProvisionResult,
+    AgentRuntimeEnsureReadyResult,
+)
 
 T = TypeVar("T")
 TEST_TOKEN = "super-secret-test-token"
@@ -30,6 +40,19 @@ def run_async(awaitable: Awaitable[T]) -> T:
 
 def provision_response() -> dict[str, str]:
     return {"agent_id": f"web-user-{SNOWFLAKE_ID}"}
+
+
+def chat_response(answer: str = "回答内容") -> dict[str, object]:
+    return {
+        "choices": [
+            {
+                "message": {
+                    "role": "assistant",
+                    "content": answer,
+                }
+            }
+        ]
+    }
 
 
 def make_async_client(
@@ -49,7 +72,6 @@ def make_openclaw_client(
     return OpenClawClient(
         base_url="http://openclaw.test/",
         gateway_token=token,
-        timeout_seconds=20,
         http_client=http_client,
     )
 
@@ -97,6 +119,12 @@ def test_provision_agent_request_format_preserves_large_id() -> None:
     assert request.url.path == PROVISION_PATH
     assert request.headers["content-type"] == "application/json"
     assert request.headers["authorization"] == f"Bearer {TEST_TOKEN}"
+    assert request.extensions["timeout"] == {
+        "connect": 10.0,
+        "read": 120.0,
+        "write": 30.0,
+        "pool": 10.0,
+    }
     assert body == {"external_user_id": SNOWFLAKE_ID}
     assert isinstance(body["external_user_id"], str)
     assert set(body) == {"external_user_id"}
@@ -312,6 +340,40 @@ def test_empty_gateway_token_fails_before_http_request() -> None:
     assert called is False
 
 
+def test_custom_openclaw_timeout_config_is_used_for_requests() -> None:
+    seen_requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen_requests.append(request)
+        return httpx.Response(200, json=chat_response())
+
+    async def scenario() -> None:
+        async with make_async_client(handler) as http_client:
+            client = OpenClawClient(
+                base_url="http://openclaw.test/",
+                gateway_token=TEST_TOKEN,
+                connect_timeout_seconds=2,
+                read_timeout_seconds=120,
+                write_timeout_seconds=5,
+                pool_timeout_seconds=3,
+                http_client=http_client,
+            )
+            await client.chat_completion(
+                agent_id="web-user-123",
+                openclaw_user=SNOWFLAKE_ID,
+                message="你好",
+            )
+
+    run_async(scenario())
+
+    assert seen_requests[0].extensions["timeout"] == {
+        "connect": 2.0,
+        "read": 120.0,
+        "write": 5.0,
+        "pool": 3.0,
+    }
+
+
 @pytest.mark.parametrize("status_code", [401, 500])
 def test_sensitive_token_not_in_exceptions_or_logs(
     status_code: int,
@@ -354,3 +416,372 @@ def test_sensitive_token_not_in_connection_failure() -> None:
             assert TEST_TOKEN not in str(exc_info.value)
 
     run_async(scenario())
+
+
+def test_chat_completion_request_format_uses_agent_model_and_user_id() -> None:
+    seen_requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen_requests.append(request)
+        return httpx.Response(200, json=chat_response())
+
+    async def scenario() -> None:
+        async with make_async_client(handler) as http_client:
+            await make_openclaw_client(http_client).chat_completion(
+                agent_id="web-user-123",
+                openclaw_user=SNOWFLAKE_ID,
+                message="你好",
+            )
+
+    run_async(scenario())
+
+    assert len(seen_requests) == 1
+    request = seen_requests[0]
+    body = json.loads(request.content.decode())
+    assert request.method == "POST"
+    assert request.url.path == CHAT_COMPLETIONS_PATH
+    assert request.headers["content-type"] == "application/json"
+    assert request.headers["authorization"] == f"Bearer {TEST_TOKEN}"
+    assert request.extensions["timeout"] == {
+        "connect": 10.0,
+        "read": 120.0,
+        "write": 30.0,
+        "pool": 10.0,
+    }
+    assert body == {
+        "model": "openclaw/web-user-123",
+        "user": SNOWFLAKE_ID,
+        "messages": [{"role": "user", "content": "你好"}],
+        "stream": False,
+    }
+    assert body["user"] != "web-user-123"
+
+
+def test_chat_completion_ignores_extra_response_fields() -> None:
+    async def scenario() -> str:
+        async with make_async_client(
+            lambda _request: httpx.Response(
+                200,
+                json={
+                    "id": "chatcmpl-123",
+                    "object": "chat.completion",
+                    "created": 123456,
+                    "model": "openclaw/web-user-123",
+                    "choices": [
+                        {
+                            "index": 0,
+                            "message": {
+                                "role": "assistant",
+                                "content": "回答内容",
+                                "extra_field": "ignored",
+                            },
+                            "finish_reason": "stop",
+                        }
+                    ],
+                    "usage": {
+                        "prompt_tokens": 10,
+                        "completion_tokens": 20,
+                        "total_tokens": 30,
+                    },
+                    "extra_top_level_field": "ignored",
+                },
+            ),
+        ) as http_client:
+            result = await make_openclaw_client(http_client).chat_completion(
+                agent_id="web-user-123",
+                openclaw_user=SNOWFLAKE_ID,
+                message="你好",
+            )
+            return result.answer
+
+    assert run_async(scenario()) == "回答内容"
+
+
+@pytest.mark.parametrize(
+    ("status_code", "expected_error"),
+    [
+        (400, OpenClawRequestError),
+        (401, OpenClawAuthenticationError),
+        (403, OpenClawAuthenticationError),
+        (404, OpenClawResponseError),
+        (409, OpenClawConflictError),
+        (413, OpenClawRequestError),
+        (429, OpenClawResponseError),
+        (500, OpenClawResponseError),
+    ],
+)
+def test_chat_completion_maps_http_errors(
+    status_code: int,
+    expected_error: type[Exception],
+) -> None:
+    async def scenario() -> None:
+        async with make_async_client(
+            lambda _request: httpx.Response(
+                status_code,
+                json={"detail": TEST_TOKEN},
+            ),
+        ) as http_client:
+            with pytest.raises(expected_error) as exc_info:
+                await make_openclaw_client(http_client).chat_completion(
+                    agent_id="web-user-123",
+                    openclaw_user=SNOWFLAKE_ID,
+                    message="你好",
+                )
+            assert TEST_TOKEN not in str(exc_info.value)
+
+    run_async(scenario())
+
+
+def test_chat_completion_maps_runtime_owner_500_to_not_ready() -> None:
+    async def scenario() -> None:
+        async with make_async_client(
+            lambda _request: httpx.Response(
+                500,
+                json={
+                    "error": {
+                        "message": (
+                            "prepared model runtime owner was not committed"
+                        ),
+                        "type": "api_error",
+                    }
+                },
+            ),
+        ) as http_client:
+            with pytest.raises(OpenClawRuntimeNotReadyError):
+                await make_openclaw_client(http_client).chat_completion(
+                    agent_id="web-user-123",
+                    openclaw_user=SNOWFLAKE_ID,
+                    message="你好",
+                )
+
+    run_async(scenario())
+
+
+def test_chat_completion_timeout() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ReadTimeout("read timed out", request=request)
+
+    async def scenario() -> None:
+        async with make_async_client(handler) as http_client:
+            with pytest.raises(OpenClawTimeoutError):
+                await make_openclaw_client(http_client).chat_completion(
+                    agent_id="web-user-123",
+                    openclaw_user=SNOWFLAKE_ID,
+                    message="你好",
+                )
+
+    run_async(scenario())
+
+
+def test_chat_completion_connection_failure() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("connect failed", request=request)
+
+    async def scenario() -> None:
+        async with make_async_client(handler) as http_client:
+            with pytest.raises(OpenClawConnectionError):
+                await make_openclaw_client(http_client).chat_completion(
+                    agent_id="web-user-123",
+                    openclaw_user=SNOWFLAKE_ID,
+                    message="你好",
+                )
+
+    run_async(scenario())
+
+
+def test_chat_completion_rejects_invalid_json() -> None:
+    async def scenario() -> None:
+        async with make_async_client(
+            lambda _request: httpx.Response(200, content=b"not-json"),
+        ) as http_client:
+            with pytest.raises(OpenClawResponseError):
+                await make_openclaw_client(http_client).chat_completion(
+                    agent_id="web-user-123",
+                    openclaw_user=SNOWFLAKE_ID,
+                    message="你好",
+                )
+
+    run_async(scenario())
+
+
+@pytest.mark.parametrize(
+    "response",
+    [
+        {},
+        {"choices": []},
+        {"choices": [{}]},
+        {"choices": [{"message": {}}]},
+        {"choices": [{"message": {"content": ""}}]},
+        {"choices": [{"message": {"content": "   "}}]},
+        {"choices": [{"message": {"content": ["unsupported"]}}]},
+    ],
+)
+def test_chat_completion_rejects_invalid_response_shape(
+    response: dict[str, object],
+) -> None:
+    async def scenario() -> None:
+        async with make_async_client(
+            lambda _request: httpx.Response(200, json=response),
+        ) as http_client:
+            with pytest.raises(OpenClawResponseError):
+                await make_openclaw_client(http_client).chat_completion(
+                    agent_id="web-user-123",
+                    openclaw_user=SNOWFLAKE_ID,
+                    message="你好",
+                )
+
+    run_async(scenario())
+
+
+def test_ensure_agent_runtime_ready_request_and_response() -> None:
+    seen_requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen_requests.append(request)
+        return httpx.Response(
+            200,
+            json={
+                "ok": True,
+                "payload": {
+                    "ok": True,
+                    "agentId": "web-user-123",
+                    "ready": False,
+                    "refreshed": True,
+                    "reason": "runtime_owner_not_ready",
+                    "retryAfterMs": 3000,
+                },
+            },
+        )
+
+    async def scenario() -> AgentRuntimeEnsureReadyResult:
+        async with make_async_client(handler) as http_client:
+            return await make_openclaw_client(
+                http_client
+            ).ensure_agent_runtime_ready(agent_id="web-user-123")
+
+    result = run_async(scenario())
+
+    assert len(seen_requests) == 1
+    request = seen_requests[0]
+    body = json.loads(request.content.decode())
+    assert request.method == "POST"
+    assert request.url.path == ADMIN_RPC_PATH
+    assert request.headers["authorization"] == f"Bearer {TEST_TOKEN}"
+    assert request.extensions["timeout"] == {
+        "connect": 10.0,
+        "read": 120.0,
+        "write": 30.0,
+        "pool": 10.0,
+    }
+    assert body == {
+        "method": ENSURE_AGENT_RUNTIME_READY_METHOD,
+        "params": {"agentId": "web-user-123"},
+    }
+    assert result.agent_id == "web-user-123"
+    assert result.ready is False
+    assert result.ok is True
+    assert result.refreshed is True
+    assert result.reason == "runtime_owner_not_ready"
+    assert result.retry_after_ms == 3000
+
+
+def test_ensure_agent_runtime_ready_accepts_direct_business_payload() -> None:
+    async def scenario() -> AgentRuntimeEnsureReadyResult:
+        async with make_async_client(
+            lambda _request: httpx.Response(
+                200,
+                json={
+                    "ok": True,
+                    "agentId": "web-user-123",
+                    "ready": True,
+                    "refreshed": False,
+                    "retryAfterMs": 0,
+                },
+            ),
+        ) as http_client:
+            return await make_openclaw_client(
+                http_client
+            ).ensure_agent_runtime_ready(agent_id="web-user-123")
+
+    result = run_async(scenario())
+
+    assert result.ok is True
+    assert result.agent_id == "web-user-123"
+    assert result.ready is True
+    assert result.refreshed is False
+    assert result.retry_after_ms == 0
+
+
+@pytest.mark.parametrize(
+    "response_payload",
+    [
+        {
+            "ok": False,
+            "agentId": "web-user-missing",
+            "ready": False,
+            "error": "agent_not_found",
+        },
+        {
+            "ok": False,
+            "agentId": "web-user-refresh-failed",
+            "ready": False,
+            "error": "runtime_refresh_failed",
+            "retryAfterMs": 3000,
+        },
+    ],
+)
+def test_ensure_agent_runtime_ready_parses_business_failures(
+    response_payload: dict[str, object],
+) -> None:
+    async def scenario() -> AgentRuntimeEnsureReadyResult:
+        async with make_async_client(
+            lambda _request: httpx.Response(
+                200,
+                json={"ok": True, "payload": response_payload},
+            ),
+        ) as http_client:
+            return await make_openclaw_client(
+                http_client
+            ).ensure_agent_runtime_ready(
+                agent_id=str(response_payload["agentId"]),
+            )
+
+    result = run_async(scenario())
+
+    assert result.ok is False
+    assert result.ready is False
+    assert result.error == response_payload["error"]
+
+
+@pytest.mark.parametrize(
+    "agent_id",
+    [
+        "",
+        "   ",
+        "UpperCase",
+        "-starts-with-dash",
+        "_starts_with_underscore",
+        "has.dot",
+        "a" * 65,
+    ],
+)
+def test_ensure_agent_runtime_ready_rejects_non_canonical_agent_id(
+    agent_id: str,
+) -> None:
+    called = False
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        nonlocal called
+        called = True
+        return httpx.Response(200, json={})
+
+    async def scenario() -> None:
+        async with make_async_client(handler) as http_client:
+            with pytest.raises(OpenClawRequestError):
+                await make_openclaw_client(
+                    http_client
+                ).ensure_agent_runtime_ready(agent_id=agent_id)
+
+    run_async(scenario())
+
+    assert called is False

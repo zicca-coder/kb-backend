@@ -11,7 +11,10 @@ from app.core.errors import (
 )
 from app.models.user import User
 from app.models.user_agent import UserAgent
-from app.schemas.openclaw import AgentProvisionResult
+from app.schemas.openclaw import (
+    AgentProvisionResult,
+    AgentRuntimeEnsureReadyResult,
+)
 
 REGISTER_URL = "/api/auth/register"
 LOGIN_URL = "/api/auth/login"
@@ -34,10 +37,22 @@ class FailingOpenClawClient:
         self.calls.append(str(external_user_id))
         raise self.exc
 
+    async def ensure_agent_runtime_ready(
+        self,
+        *,
+        agent_id: str,
+    ) -> AgentRuntimeEnsureReadyResult:
+        raise AssertionError("runtime readiness should not be checked")
+
 
 class RecordingOpenClawClient:
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        readiness: AgentRuntimeEnsureReadyResult | None = None,
+    ) -> None:
         self.calls: list[str] = []
+        self.readiness_calls: list[str] = []
+        self.readiness = readiness
 
     async def provision_agent(
         self,
@@ -47,6 +62,20 @@ class RecordingOpenClawClient:
         normalized = str(external_user_id)
         self.calls.append(normalized)
         return AgentProvisionResult(agent_id=f"web-user-{normalized}")
+
+    async def ensure_agent_runtime_ready(
+        self,
+        *,
+        agent_id: str,
+    ) -> AgentRuntimeEnsureReadyResult:
+        self.readiness_calls.append(agent_id)
+        return self.readiness or AgentRuntimeEnsureReadyResult(
+            ok=True,
+            agentId=agent_id,
+            ready=True,
+            refreshed=True,
+            retryAfterMs=0,
+        )
 
 
 def _register(
@@ -92,7 +121,7 @@ def _set_failed_agent(db_session: Session, user_id: str) -> None:
     user_agent = _stored_agent(db_session, user_id)
     user_agent.agent_id = None
     user_agent.provision_status = "failed"
-    user_agent.provision_error = "OpenClaw request timed out"
+    user_agent.provision_error = "Backend timed out while waiting for OpenClaw"
     db_session.commit()
 
 
@@ -115,7 +144,45 @@ def test_register_auto_provisions_with_string_external_user_id(
     assert user_agent.provision_status == "ready"
     assert user_agent.provision_error is None
     assert created["agent"]["provision_status"] == "ready"
+    assert created["agent"]["agent_ready"] is True
+    assert created["agent"]["retry_after_ms"] is None
     assert isinstance(created["id"], str)
+
+
+def test_register_marks_agent_warming_when_runtime_not_ready(
+    client: TestClient,
+    db_session: Session,
+) -> None:
+    readiness = AgentRuntimeEnsureReadyResult(
+        ok=True,
+        agentId="web-user-placeholder",
+        ready=False,
+        refreshed=True,
+        reason="runtime_owner_not_ready",
+        retryAfterMs=3000,
+    )
+    recording_client = RecordingOpenClawClient(readiness=readiness)
+    client.app.dependency_overrides[get_openclaw_client] = (
+        lambda: recording_client
+    )
+
+    created = _register(
+        client,
+        username="runtime_warming",
+        phone="13800138112",
+    )
+
+    user_agent = _stored_agent(db_session, str(created["id"]))
+    assert recording_client.calls == [created["id"]]
+    assert recording_client.readiness_calls == [
+        f"web-user-{created['id']}"
+    ]
+    assert user_agent.agent_id == f"web-user-{created['id']}"
+    assert user_agent.provision_status == "warming"
+    assert user_agent.provision_error == "runtime_owner_not_ready"
+    assert created["agent"]["provision_status"] == "warming"
+    assert created["agent"]["agent_ready"] is False
+    assert created["agent"]["retry_after_ms"] == 3000
 
 
 def test_register_keeps_user_when_openclaw_times_out(
@@ -140,7 +207,9 @@ def test_register_keeps_user_when_openclaw_times_out(
     assert user is not None
     assert user_agent.agent_id is None
     assert user_agent.provision_status == "failed"
-    assert user_agent.provision_error == "OpenClaw request timed out"
+    assert user_agent.provision_error == (
+        "Backend timed out while waiting for OpenClaw"
+    )
     assert created["agent"]["agent_id"] is None
     assert created["agent"]["provision_status"] == "failed"
     assert TEST_TOKEN not in str(created)
@@ -242,14 +311,18 @@ def test_manual_retry_from_failed_succeeds(
     db_session.expire_all()
     user_agent = _stored_agent(db_session, str(created["id"]))
     assert recording_client.calls == [created["id"]]
+    assert recording_client.readiness_calls == [
+        f"web-user-{created['id']}"
+    ]
     assert result["agent_id"] == f"web-user-{created['id']}"
     assert result["provision_status"] == "ready"
+    assert result["agent_ready"] is True
     assert user_agent.agent_id == f"web-user-{created['id']}"
     assert user_agent.provision_status == "ready"
     assert user_agent.provision_error is None
 
 
-def test_ready_manual_retry_is_idempotent(
+def test_registered_manual_retry_is_idempotent(
     client: TestClient,
     openclaw_calls: list[str],
 ) -> None:
@@ -343,6 +416,9 @@ def test_manual_provision_uses_current_user_only(
     agent_b = _stored_agent(db_session, str(user_b["id"]))
     assert response.status_code == 200
     assert recording_client.calls == [user_a["id"]]
+    assert recording_client.readiness_calls == [
+        f"web-user-{user_a['id']}"
+    ]
     assert agent_a.provision_status == "ready"
     assert agent_b.provision_status == "failed"
 
@@ -367,5 +443,7 @@ def test_get_my_user_agent_returns_safe_provision_error(
     assert response.status_code == 200
     result = response.json()["data"]
     assert result["provision_status"] == "failed"
-    assert result["provision_error"] != "OpenClaw request timed out"
+    assert result["provision_error"] != (
+        "Backend timed out while waiting for OpenClaw"
+    )
     assert TEST_TOKEN not in str(result)

@@ -24,7 +24,7 @@ class OpenClawConnectionError(OpenClawError):
 
 
 class OpenClawTimeoutError(OpenClawError):
-    """OpenClaw Gateway request timed out."""
+    """Backend timed out while waiting for OpenClaw Gateway."""
 
 
 class OpenClawAuthenticationError(OpenClawError):
@@ -41,6 +41,10 @@ class OpenClawRequestError(OpenClawError):
 
 class OpenClawResponseError(OpenClawError):
     """OpenClaw returned an invalid or unsuccessful response."""
+
+
+class OpenClawRuntimeNotReadyError(OpenClawResponseError):
+    """OpenClaw Agent exists but runtime is not ready for chat."""
 
 
 class AppError(Exception):

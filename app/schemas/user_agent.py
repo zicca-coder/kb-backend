@@ -11,6 +11,7 @@ from pydantic import (
 
 from app.schemas.ids import SnowflakeId
 from app.core.provisioning import (
+    DEFAULT_AGENT_RETRY_AFTER_MS,
     SAFE_PUBLIC_PROVISION_ERROR,
     ProvisionStatus,
 )
@@ -95,6 +96,9 @@ class UserAgentPublicRead(BaseModel):
     runtime_id: str | None
     provision_status: ProvisionStatus
     provision_error: str | None
+    agent_ready: bool = False
+    retry_after_ms: int | None = None
+    requires_gateway_restart: bool = False
     is_deleted: bool
     created_by: str
     created_at: datetime
@@ -108,6 +112,12 @@ class UserAgentPublicRead(BaseModel):
             and self.provision_error is not None
         ):
             self.provision_error = SAFE_PUBLIC_PROVISION_ERROR
+        self.agent_ready = self.provision_status == ProvisionStatus.READY
+        if self.provision_status in (
+            ProvisionStatus.REGISTERED,
+            ProvisionStatus.WARMING,
+        ):
+            self.retry_after_ms = DEFAULT_AGENT_RETRY_AFTER_MS
         return self
 
 
@@ -115,6 +125,9 @@ class UserAgentProvisionSummary(BaseModel):
     agent_id: str | None
     provision_status: ProvisionStatus
     provision_error: str | None = None
+    agent_ready: bool = False
+    retry_after_ms: int | None = None
+    requires_gateway_restart: bool = False
 
     @model_validator(mode="after")
     def hide_internal_provision_error(
@@ -125,6 +138,12 @@ class UserAgentProvisionSummary(BaseModel):
             and self.provision_error is not None
         ):
             self.provision_error = SAFE_PUBLIC_PROVISION_ERROR
+        self.agent_ready = self.provision_status == ProvisionStatus.READY
+        if self.provision_status in (
+            ProvisionStatus.REGISTERED,
+            ProvisionStatus.WARMING,
+        ):
+            self.retry_after_ms = DEFAULT_AGENT_RETRY_AFTER_MS
         return self
 
 

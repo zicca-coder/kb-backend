@@ -1,5 +1,6 @@
 import logging
 import re
+from dataclasses import dataclass
 from json import JSONDecodeError
 from typing import Any
 
@@ -13,14 +14,49 @@ from app.core.errors import (
     OpenClawConnectionError,
     OpenClawRequestError,
     OpenClawResponseError,
+    OpenClawRuntimeNotReadyError,
     OpenClawTimeoutError,
 )
-from app.schemas.openclaw import AgentProvisionResult
+from app.schemas.openclaw import (
+    AgentProvisionResult,
+    AgentRuntimeEnsureReadyResult,
+    OpenClawChatResult,
+)
 
 logger = logging.getLogger(__name__)
 
 PROVISION_PATH = "/api/internal/agent-provisioner/provision"
+CHAT_COMPLETIONS_PATH = "/v1/chat/completions"
+ADMIN_RPC_PATH = "/api/v1/admin/rpc"
+ENSURE_AGENT_RUNTIME_READY_METHOD = "agents.runtime.ensureReady"
 EXTERNAL_USER_ID_PATTERN = re.compile(r"^[1-9][0-9]*$")
+CANONICAL_AGENT_ID_PATTERN = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
+RUNTIME_NOT_READY_PATTERNS = (
+    "prepared model runtime owner was not committed",
+    "runtime owner",
+    "runtime_not_ready",
+)
+DEFAULT_CONNECT_TIMEOUT_SECONDS = 10.0
+DEFAULT_READ_TIMEOUT_SECONDS = 120.0
+DEFAULT_WRITE_TIMEOUT_SECONDS = 30.0
+DEFAULT_POOL_TIMEOUT_SECONDS = 10.0
+
+
+@dataclass(frozen=True, slots=True)
+class OpenClawTimeoutConfig:
+    connect: float = DEFAULT_CONNECT_TIMEOUT_SECONDS
+    read: float = DEFAULT_READ_TIMEOUT_SECONDS
+    write: float = DEFAULT_WRITE_TIMEOUT_SECONDS
+    pool: float = DEFAULT_POOL_TIMEOUT_SECONDS
+
+    def to_httpx_timeout(self) -> httpx.Timeout:
+        return httpx.Timeout(
+            timeout=None,
+            connect=self.connect,
+            read=self.read,
+            write=self.write,
+            pool=self.pool,
+        )
 
 
 class OpenClawClient:
@@ -29,12 +65,22 @@ class OpenClawClient:
         *,
         base_url: str,
         gateway_token: str,
-        timeout_seconds: float = 20,
+        timeout_seconds: float | None = None,
+        connect_timeout_seconds: float = DEFAULT_CONNECT_TIMEOUT_SECONDS,
+        read_timeout_seconds: float = DEFAULT_READ_TIMEOUT_SECONDS,
+        write_timeout_seconds: float = DEFAULT_WRITE_TIMEOUT_SECONDS,
+        pool_timeout_seconds: float = DEFAULT_POOL_TIMEOUT_SECONDS,
         http_client: httpx.AsyncClient | None = None,
     ) -> None:
         self._base_url = self._normalize_base_url(base_url)
         self._gateway_token = self._validate_gateway_token(gateway_token)
-        self._timeout_seconds = self._validate_timeout(timeout_seconds)
+        self._timeout = self._build_timeout(
+            timeout_seconds=timeout_seconds,
+            connect_timeout_seconds=connect_timeout_seconds,
+            read_timeout_seconds=read_timeout_seconds,
+            write_timeout_seconds=write_timeout_seconds,
+            pool_timeout_seconds=pool_timeout_seconds,
+        )
         self._http_client = http_client
 
     async def provision_agent(
@@ -51,12 +97,12 @@ class OpenClawClient:
                     self._request_url(),
                     headers=self._auth_headers(),
                     json={"external_user_id": normalized_user_id},
-                    timeout=self._timeout_seconds,
+                    timeout=self._timeout,
                 )
             else:
                 async with httpx.AsyncClient(
                     base_url=self._base_url,
-                    timeout=self._timeout_seconds,
+                    timeout=self._timeout,
                 ) as client:
                     response = await client.post(
                         PROVISION_PATH,
@@ -65,7 +111,7 @@ class OpenClawClient:
                     )
         except httpx.TimeoutException as exc:
             raise OpenClawTimeoutError(
-                "OpenClaw Gateway request timed out",
+                "Backend timed out while waiting for OpenClaw Gateway",
             ) from exc
         except (httpx.ConnectError, httpx.NetworkError) as exc:
             raise OpenClawConnectionError(
@@ -105,6 +151,120 @@ class OpenClawClient:
         )
         return result
 
+    async def chat_completion(
+        self,
+        *,
+        agent_id: str,
+        openclaw_user: str,
+        message: str,
+    ) -> OpenClawChatResult:
+        normalized_agent_id = self._normalize_agent_id(agent_id)
+        normalized_openclaw_user = self._normalize_openclaw_user(
+            openclaw_user,
+        )
+        normalized_message = self._normalize_chat_message(message)
+        payload = {
+            "model": f"openclaw/{normalized_agent_id}",
+            "user": normalized_openclaw_user,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": normalized_message,
+                }
+            ],
+            "stream": False,
+        }
+
+        try:
+            if self._http_client is not None:
+                response = await self._http_client.post(
+                    self._chat_request_url(),
+                    headers=self._auth_headers(),
+                    json=payload,
+                    timeout=self._timeout,
+                )
+            else:
+                async with httpx.AsyncClient(
+                    base_url=self._base_url,
+                    timeout=self._timeout,
+                ) as client:
+                    response = await client.post(
+                        CHAT_COMPLETIONS_PATH,
+                        headers=self._auth_headers(),
+                        json=payload,
+                    )
+        except httpx.TimeoutException as exc:
+            raise OpenClawTimeoutError(
+                "Backend timed out while waiting for OpenClaw Gateway",
+            ) from exc
+        except (httpx.ConnectError, httpx.NetworkError) as exc:
+            raise OpenClawConnectionError(
+                "Unable to connect to OpenClaw Gateway",
+            ) from exc
+        except httpx.RequestError as exc:
+            raise OpenClawConnectionError(
+                "OpenClaw Gateway request failed",
+            ) from exc
+
+        self._raise_chat_status(
+            response.status_code,
+            agent_id=normalized_agent_id,
+            response=response,
+        )
+        result = self._parse_chat_response(response)
+        logger.info(
+            "OpenClaw chat completion succeeded, agent_id=%s",
+            normalized_agent_id,
+        )
+        return result
+
+    async def ensure_agent_runtime_ready(
+        self,
+        *,
+        agent_id: str,
+    ) -> AgentRuntimeEnsureReadyResult:
+        normalized_agent_id = self._normalize_canonical_agent_id(agent_id)
+        payload = {
+            "method": ENSURE_AGENT_RUNTIME_READY_METHOD,
+            "params": {"agentId": normalized_agent_id},
+        }
+        try:
+            if self._http_client is not None:
+                response = await self._http_client.post(
+                    self._admin_rpc_request_url(),
+                    headers=self._auth_headers(),
+                    json=payload,
+                    timeout=self._timeout,
+                )
+            else:
+                async with httpx.AsyncClient(
+                    base_url=self._base_url,
+                    timeout=self._timeout,
+                ) as client:
+                    response = await client.post(
+                        ADMIN_RPC_PATH,
+                        headers=self._auth_headers(),
+                        json=payload,
+                    )
+        except httpx.TimeoutException as exc:
+            raise OpenClawTimeoutError(
+                "Backend timed out while waiting for OpenClaw Gateway",
+            ) from exc
+        except (httpx.ConnectError, httpx.NetworkError) as exc:
+            raise OpenClawConnectionError(
+                "Unable to connect to OpenClaw Gateway",
+            ) from exc
+        except httpx.RequestError as exc:
+            raise OpenClawConnectionError(
+                "OpenClaw Gateway request failed",
+            ) from exc
+
+        self._raise_admin_rpc_status(
+            response.status_code,
+            agent_id=normalized_agent_id,
+        )
+        return self._parse_agent_runtime_ready_response(response)
+
     @staticmethod
     def _normalize_base_url(base_url: str) -> str:
         if not isinstance(base_url, str):
@@ -127,22 +287,63 @@ class OpenClawClient:
         return gateway_token.strip()
 
     @staticmethod
-    def _validate_timeout(timeout_seconds: float) -> float:
-        if isinstance(timeout_seconds, bool):
+    def _validate_timeout_component(value: float, *, name: str) -> float:
+        if isinstance(value, bool):
             raise OpenClawConfigurationError(
-                "OpenClaw timeout must be greater than 0",
+                f"OpenClaw {name} timeout must be greater than 0",
             )
         try:
-            timeout = float(timeout_seconds)
+            timeout = float(value)
         except (TypeError, ValueError) as exc:
             raise OpenClawConfigurationError(
-                "OpenClaw timeout must be greater than 0",
+                f"OpenClaw {name} timeout must be greater than 0",
             ) from exc
         if timeout <= 0:
             raise OpenClawConfigurationError(
-                "OpenClaw timeout must be greater than 0",
+                f"OpenClaw {name} timeout must be greater than 0",
             )
         return timeout
+
+    @classmethod
+    def _build_timeout(
+        cls,
+        *,
+        timeout_seconds: float | None,
+        connect_timeout_seconds: float,
+        read_timeout_seconds: float,
+        write_timeout_seconds: float,
+        pool_timeout_seconds: float,
+    ) -> httpx.Timeout:
+        if timeout_seconds is not None:
+            timeout = cls._validate_timeout_component(
+                timeout_seconds,
+                name="legacy",
+            )
+            return OpenClawTimeoutConfig(
+                connect=timeout,
+                read=timeout,
+                write=timeout,
+                pool=timeout,
+            ).to_httpx_timeout()
+
+        return OpenClawTimeoutConfig(
+            connect=cls._validate_timeout_component(
+                connect_timeout_seconds,
+                name="connect",
+            ),
+            read=cls._validate_timeout_component(
+                read_timeout_seconds,
+                name="read",
+            ),
+            write=cls._validate_timeout_component(
+                write_timeout_seconds,
+                name="write",
+            ),
+            pool=cls._validate_timeout_component(
+                pool_timeout_seconds,
+                name="pool",
+            ),
+        ).to_httpx_timeout()
 
     @staticmethod
     def _normalize_external_user_id(external_user_id: int | str) -> str:
@@ -162,8 +363,54 @@ class OpenClawClient:
             return normalized
         raise OpenClawRequestError(message)
 
+    @staticmethod
+    def _normalize_agent_id(agent_id: str) -> str:
+        if not isinstance(agent_id, str):
+            raise OpenClawRequestError("agent_id must be a non-empty string")
+        normalized = agent_id.strip()
+        if not normalized:
+            raise OpenClawRequestError("agent_id must be a non-empty string")
+        return normalized
+
+    @classmethod
+    def _normalize_canonical_agent_id(cls, agent_id: str) -> str:
+        normalized = cls._normalize_agent_id(agent_id)
+        if not CANONICAL_AGENT_ID_PATTERN.fullmatch(normalized):
+            raise OpenClawRequestError(
+                "agent_id must be a canonical OpenClaw Agent ID",
+            )
+        return normalized
+
+    @staticmethod
+    def _normalize_openclaw_user(openclaw_user: str) -> str:
+        if not isinstance(openclaw_user, str):
+            raise OpenClawRequestError(
+                "openclaw_user must be a non-empty string",
+            )
+        normalized = openclaw_user.strip()
+        if not normalized:
+            raise OpenClawRequestError(
+                "openclaw_user must be a non-empty string",
+            )
+        return normalized
+
+    @staticmethod
+    def _normalize_chat_message(message: str) -> str:
+        if not isinstance(message, str):
+            raise OpenClawRequestError("message must be a non-empty string")
+        normalized = message.strip()
+        if not normalized:
+            raise OpenClawRequestError("message must be a non-empty string")
+        return normalized
+
     def _request_url(self) -> str:
         return f"{self._base_url}{PROVISION_PATH}"
+
+    def _chat_request_url(self) -> str:
+        return f"{self._base_url}{CHAT_COMPLETIONS_PATH}"
+
+    def _admin_rpc_request_url(self) -> str:
+        return f"{self._base_url}{ADMIN_RPC_PATH}"
 
     def _auth_headers(self) -> dict[str, str]:
         return {"Authorization": f"Bearer {self._gateway_token}"}
@@ -202,6 +449,88 @@ class OpenClawClient:
             f"OpenClaw provisioning failed with HTTP {status_code}",
         )
 
+    def _raise_chat_status(
+        self,
+        status_code: int,
+        *,
+        agent_id: str,
+        response: httpx.Response | None = None,
+    ) -> None:
+        if status_code == 200:
+            return
+        logger.warning(
+            "OpenClaw chat completion failed, agent_id=%s, status_code=%s",
+            agent_id,
+            status_code,
+        )
+        if status_code in (401, 403):
+            raise OpenClawAuthenticationError(
+                "OpenClaw Gateway authentication failed",
+            )
+        if status_code == 409:
+            raise OpenClawConflictError(
+                "OpenClaw Agent conflicts with the chat request",
+            )
+        if status_code in (400, 413):
+            raise OpenClawRequestError(
+                "OpenClaw rejected the chat request",
+            )
+        if status_code == 429:
+            raise OpenClawResponseError(
+                "OpenClaw chat request was rate limited",
+            )
+        if status_code == 404:
+            raise OpenClawResponseError(
+                "OpenClaw Agent or chat endpoint was not found",
+            )
+        if 500 <= status_code <= 599:
+            if (
+                response is not None
+                and self._response_indicates_runtime_not_ready(response)
+            ):
+                raise OpenClawRuntimeNotReadyError(
+                    "OpenClaw Agent runtime is not ready",
+                )
+            raise OpenClawResponseError(
+                f"OpenClaw chat failed with HTTP {status_code}",
+            )
+        raise OpenClawResponseError(
+            f"OpenClaw chat failed with HTTP {status_code}",
+        )
+
+    def _raise_admin_rpc_status(
+        self,
+        status_code: int,
+        *,
+        agent_id: str,
+    ) -> None:
+        if status_code == 200:
+            return
+        logger.warning(
+            "OpenClaw admin RPC failed, agent_id=%s, status_code=%s",
+            agent_id,
+            status_code,
+        )
+        if status_code in (401, 403):
+            raise OpenClawAuthenticationError(
+                "OpenClaw Gateway authentication failed",
+            )
+        if status_code in (400, 413):
+            raise OpenClawRequestError(
+                "OpenClaw rejected the admin RPC request",
+            )
+        if status_code == 404:
+            raise OpenClawResponseError(
+                "OpenClaw admin RPC endpoint was not found",
+            )
+        if 500 <= status_code <= 599:
+            raise OpenClawResponseError(
+                f"OpenClaw admin RPC failed with HTTP {status_code}",
+            )
+        raise OpenClawResponseError(
+            f"OpenClaw admin RPC failed with HTTP {status_code}",
+        )
+
     @staticmethod
     def _parse_success_response(
         response: httpx.Response,
@@ -234,3 +563,123 @@ class OpenClawClient:
             return cls._parse_success_response(response)
         except OpenClawResponseError:
             return None
+
+    @staticmethod
+    def _parse_chat_response(
+        response: httpx.Response,
+    ) -> OpenClawChatResult:
+        try:
+            data: Any = response.json()
+        except (JSONDecodeError, ValueError) as exc:
+            raise OpenClawResponseError(
+                "OpenClaw returned an invalid JSON response",
+            ) from exc
+
+        if not isinstance(data, dict):
+            raise OpenClawResponseError(
+                "OpenClaw returned an invalid response format",
+            )
+
+        choices = data.get("choices")
+        if not isinstance(choices, list) or not choices:
+            raise OpenClawResponseError(
+                "OpenClaw returned an invalid response format",
+            )
+
+        first_choice = choices[0]
+        if not isinstance(first_choice, dict):
+            raise OpenClawResponseError(
+                "OpenClaw returned an invalid response format",
+            )
+
+        message = first_choice.get("message")
+        if not isinstance(message, dict):
+            raise OpenClawResponseError(
+                "OpenClaw returned an invalid response format",
+            )
+
+        content = message.get("content")
+        if not isinstance(content, str) or not content.strip():
+            raise OpenClawResponseError(
+                "OpenClaw returned an empty chat response",
+            )
+
+        return OpenClawChatResult(answer=content)
+
+    @staticmethod
+    def _parse_agent_runtime_ready_response(
+        response: httpx.Response,
+    ) -> AgentRuntimeEnsureReadyResult:
+        try:
+            data: Any = response.json()
+        except (JSONDecodeError, ValueError) as exc:
+            raise OpenClawResponseError(
+                "OpenClaw returned an invalid JSON response",
+            ) from exc
+
+        if not isinstance(data, dict):
+            raise OpenClawResponseError(
+                "OpenClaw returned an invalid response format",
+            )
+
+        data = OpenClawClient._unwrap_admin_rpc_payload(data)
+
+        try:
+            return AgentRuntimeEnsureReadyResult.model_validate(data)
+        except ValidationError as exc:
+            raise OpenClawResponseError(
+                "OpenClaw returned an invalid response format",
+            ) from exc
+
+    @staticmethod
+    def _unwrap_admin_rpc_payload(data: dict[str, Any]) -> dict[str, Any]:
+        if "payload" not in data:
+            return data
+
+        ok = data.get("ok")
+        if ok is not True:
+            error = data.get("error")
+            if isinstance(error, dict):
+                code = error.get("code")
+                message = error.get("message")
+                detail = code if isinstance(code, str) else message
+                if isinstance(detail, str) and detail:
+                    raise OpenClawResponseError(
+                        f"OpenClaw admin RPC failed: {detail}",
+                    )
+            raise OpenClawResponseError("OpenClaw admin RPC failed")
+
+        payload = data.get("payload")
+        if not isinstance(payload, dict):
+            raise OpenClawResponseError(
+                "OpenClaw returned an invalid response format",
+            )
+        return payload
+
+    @staticmethod
+    def _response_indicates_runtime_not_ready(
+        response: httpx.Response,
+    ) -> bool:
+        try:
+            data: Any = response.json()
+        except (JSONDecodeError, ValueError):
+            return False
+
+        candidates: list[str] = []
+        if isinstance(data, dict):
+            error = data.get("error")
+            if isinstance(error, dict):
+                for key in ("message", "type", "code"):
+                    value = error.get(key)
+                    if isinstance(value, str):
+                        candidates.append(value)
+            for key in ("message", "detail", "type", "code"):
+                value = data.get(key)
+                if isinstance(value, str):
+                    candidates.append(value)
+
+        combined = " ".join(candidates).lower()
+        return any(
+            pattern in combined
+            for pattern in RUNTIME_NOT_READY_PATTERNS
+        )

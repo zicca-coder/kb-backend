@@ -17,9 +17,14 @@ from app.services.agent_provision_service import (
     AgentProvisioningService,
 )
 from app.services.auth_service import AuthService
+from app.services.chat_service import ChatService
 from app.services.user_agent_service import UserAgentService
 from app.services.user_service import UserService
-from app.schemas.openclaw import AgentProvisionResult
+from app.schemas.openclaw import (
+    AgentProvisionResult,
+    AgentRuntimeEnsureReadyResult,
+    OpenClawChatResult,
+)
 
 DatabaseDependency = Annotated[AsyncSession, Depends(get_db)]
 bearer_scheme = HTTPBearer(auto_error=False)
@@ -36,13 +41,34 @@ class UnavailableOpenClawClient:
     ) -> AgentProvisionResult:
         raise OpenClawConfigurationError(self.message)
 
+    async def chat_completion(
+        self,
+        *,
+        agent_id: str,
+        openclaw_user: str,
+        message: str,
+    ) -> OpenClawChatResult:
+        raise OpenClawConfigurationError(self.message)
+
+    async def ensure_agent_runtime_ready(
+        self,
+        *,
+        agent_id: str,
+    ) -> AgentRuntimeEnsureReadyResult:
+        raise OpenClawConfigurationError(self.message)
+
 
 def get_openclaw_client() -> AgentProvisionClient:
     try:
         return OpenClawClient(
             base_url=settings.openclaw_base_url,
             gateway_token=settings.openclaw_gateway_token.get_secret_value(),
-            timeout_seconds=settings.openclaw_timeout_seconds,
+            connect_timeout_seconds=(
+                settings.openclaw_connect_timeout_seconds
+            ),
+            read_timeout_seconds=settings.openclaw_read_timeout_seconds,
+            write_timeout_seconds=settings.openclaw_write_timeout_seconds,
+            pool_timeout_seconds=settings.openclaw_pool_timeout_seconds,
         )
     except OpenClawConfigurationError as exc:
         return UnavailableOpenClawClient(str(exc))
@@ -106,6 +132,19 @@ AgentProvisioningServiceDependency = Annotated[
 ]
 
 
+async def get_chat_service(
+    db: DatabaseDependency,
+    openclaw_client: OpenClawClientDependency,
+) -> ChatService:
+    return ChatService(db, openclaw_client)
+
+
+ChatServiceDependency = Annotated[
+    ChatService,
+    Depends(get_chat_service),
+]
+
+
 def _invalid_authentication_error() -> AuthenticationError:
     return AuthenticationError(
         code="invalid_token",
@@ -151,6 +190,7 @@ CurrentUser = Annotated[User, Depends(get_current_user)]
 
 __all__ = [
     "AuthServiceDependency",
+    "ChatServiceDependency",
     "CurrentUser",
     "DatabaseDependency",
     "AgentProvisioningServiceDependency",
