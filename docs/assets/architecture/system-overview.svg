@@ -1,0 +1,70 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1080" height="620" viewBox="0 0 1080 620" role="img" aria-labelledby="title desc">
+  <title id="title">Darwin Knowledge Platform 后端系统总体架构</title>
+  <desc id="desc">Web 前端通过 FastAPI 后端访问 MySQL、MinIO 和 OpenClaw Gateway。</desc>
+  <defs>
+    <marker id="arrow" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L0,6 L9,3 z" fill="#34515e"/>
+    </marker>
+    <style>
+      .bg { fill: #f7f9fb; }
+      .box { fill: #ffffff; stroke: #5d7685; stroke-width: 1.5; rx: 8; }
+      .group { fill: #eef4f7; stroke: #9bb0bb; stroke-width: 1.2; rx: 10; }
+      .title { font: 700 20px Arial, "Microsoft YaHei", sans-serif; fill: #1e3038; }
+      .label { font: 700 16px Arial, "Microsoft YaHei", sans-serif; fill: #243941; }
+      .text { font: 13px Arial, "Microsoft YaHei", sans-serif; fill: #36505a; }
+      .small { font: 12px Arial, "Microsoft YaHei", sans-serif; fill: #526973; }
+      .arrow { stroke: #34515e; stroke-width: 1.8; fill: none; marker-end: url(#arrow); }
+      .dash { stroke-dasharray: 6 5; }
+    </style>
+  </defs>
+  <rect class="bg" x="0" y="0" width="1080" height="620"/>
+  <text class="title" x="40" y="42">Darwin Knowledge Platform 后端系统总体架构</text>
+
+  <rect class="box" x="40" y="210" width="165" height="96"/>
+  <text class="label" x="78" y="246">Web 前端</text>
+  <text class="text" x="62" y="275">Bearer Token</text>
+  <text class="text" x="62" y="296">聊天 / 附件 / 会话</text>
+
+  <rect class="group" x="270" y="85" width="330" height="410"/>
+  <text class="label" x="395" y="120">FastAPI 后端</text>
+  <rect class="box" x="305" y="150" width="260" height="68"/>
+  <text class="label" x="390" y="178">API 层</text>
+  <text class="small" x="332" y="202">auth / chat / attachments / conversations</text>
+  <rect class="box" x="305" y="250" width="260" height="68"/>
+  <text class="label" x="378" y="278">Service 层</text>
+  <text class="small" x="327" y="302">业务规则、事务、跨模块编排</text>
+  <rect class="box" x="305" y="350" width="260" height="68"/>
+  <text class="label" x="352" y="378">Repository / Model</text>
+  <text class="small" x="334" y="402">SQLAlchemy ORM 与查询封装</text>
+
+  <rect class="box" x="690" y="95" width="300" height="96"/>
+  <text class="label" x="760" y="130">OpenClaw Gateway</text>
+  <text class="text" x="720" y="158">Agent Provision / Ready Check</text>
+  <text class="text" x="720" y="178">Chat Completions / Responses</text>
+
+  <rect class="box" x="690" y="265" width="300" height="96"/>
+  <text class="label" x="796" y="300">MySQL</text>
+  <text class="text" x="724" y="328">users / user_agents / conversations</text>
+  <text class="text" x="724" y="348">messages / attachment metadata</text>
+
+  <rect class="box" x="690" y="430" width="300" height="96"/>
+  <text class="label" x="802" y="465">MinIO</text>
+  <text class="text" x="740" y="493">私有 chat-attachments bucket</text>
+  <text class="text" x="740" y="513">保存附件二进制对象</text>
+
+  <path class="arrow" d="M205 258 L270 258"/>
+  <text class="small" x="217" y="242">HTTP / SSE</text>
+
+  <path class="arrow" d="M565 184 C620 170, 630 145, 690 143"/>
+  <text class="small" x="604" y="154">OpenClaw API</text>
+
+  <path class="arrow" d="M565 384 C625 365, 630 320, 690 313"/>
+  <text class="small" x="610" y="350">SQLAlchemy</text>
+
+  <path class="arrow" d="M565 284 C635 310, 630 470, 690 478"/>
+  <text class="small" x="594" y="434">MinIO SDK</text>
+
+  <path class="arrow dash" d="M690 506 C610 555, 450 545, 330 505"/>
+  <text class="small" x="442" y="568">附件 bytes 由后端读取后适配给 OpenClaw，不暴露对象 URL</text>
+</svg>
+

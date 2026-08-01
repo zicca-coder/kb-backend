@@ -1,0 +1,62 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1080" height="620" viewBox="0 0 1080 620" role="img" aria-labelledby="title desc">
+  <title id="title">FastAPI 后端分层架构</title>
+  <desc id="desc">展示 app/main.py、API、Dependency、Service、Repository、Model、Client 和外部系统之间的关系。</desc>
+  <defs>
+    <marker id="arrow" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L0,6 L9,3 z" fill="#35515d"/>
+    </marker>
+    <style>
+      .bg { fill: #fbfcfd; }
+      .layer { fill: #ffffff; stroke: #6e8793; stroke-width: 1.4; rx: 8; }
+      .side { fill: #eef5f2; stroke: #7fa08f; stroke-width: 1.4; rx: 8; }
+      .title { font: 700 20px Arial, "Microsoft YaHei", sans-serif; fill: #1e3038; }
+      .label { font: 700 15px Arial, "Microsoft YaHei", sans-serif; fill: #263b44; }
+      .text { font: 12.5px Arial, "Microsoft YaHei", sans-serif; fill: #48606a; }
+      .arrow { stroke: #35515d; stroke-width: 1.7; fill: none; marker-end: url(#arrow); }
+    </style>
+  </defs>
+  <rect class="bg" width="1080" height="620"/>
+  <text class="title" x="40" y="42">FastAPI 后端分层架构</text>
+
+  <rect class="layer" x="120" y="80" width="520" height="58"/>
+  <text class="label" x="310" y="108">App 组装</text>
+  <text class="text" x="245" y="128">app/main.py: create_app(), lifespan, exception handlers</text>
+
+  <rect class="layer" x="120" y="165" width="520" height="58"/>
+  <text class="label" x="314" y="193">API Router</text>
+  <text class="text" x="215" y="213">app/api/api_router.py: /api, /api/v1, /health</text>
+
+  <rect class="layer" x="120" y="250" width="520" height="58"/>
+  <text class="label" x="316" y="278">Endpoint</text>
+  <text class="text" x="185" y="298">auth / chat / attachments / conversations / users / user-agents</text>
+
+  <rect class="layer" x="120" y="335" width="520" height="58"/>
+  <text class="label" x="304" y="363">Service</text>
+  <text class="text" x="205" y="383">AuthService / ChatService / AttachmentService / ConversationService</text>
+
+  <rect class="layer" x="120" y="420" width="520" height="58"/>
+  <text class="label" x="284" y="448">Repository + Model</text>
+  <text class="text" x="207" y="468">SQLAlchemy 查询封装、ORM 表结构、关系和约束</text>
+
+  <rect class="side" x="730" y="155" width="250" height="76"/>
+  <text class="label" x="796" y="185">Dependencies</text>
+  <text class="text" x="756" y="208">当前用户、DB session、服务实例</text>
+
+  <rect class="side" x="730" y="320" width="250" height="76"/>
+  <text class="label" x="778" y="350">Client / Integration</text>
+  <text class="text" x="761" y="373">OpenClawClient / StorageService</text>
+
+  <rect class="side" x="730" y="455" width="250" height="76"/>
+  <text class="label" x="790" y="485">外部系统</text>
+  <text class="text" x="783" y="508">OpenClaw / MySQL / MinIO</text>
+
+  <path class="arrow" d="M380 138 L380 165"/>
+  <path class="arrow" d="M380 223 L380 250"/>
+  <path class="arrow" d="M380 308 L380 335"/>
+  <path class="arrow" d="M380 393 L380 420"/>
+  <path class="arrow" d="M640 279 C700 260, 700 205, 730 195"/>
+  <path class="arrow" d="M640 364 L730 358"/>
+  <path class="arrow" d="M855 396 L855 455"/>
+  <path class="arrow" d="M730 493 C665 500, 630 472, 640 448"/>
+</svg>
+
