@@ -11,7 +11,7 @@ from app.core.settings import settings
 
 engine = create_async_engine(
     settings.database_url,
-    echo=settings.app_debug,
+    echo=settings.sql_echo,
     pool_pre_ping=True,
     pool_size=5,
     max_overflow=10,

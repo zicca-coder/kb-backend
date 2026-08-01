@@ -7,6 +7,7 @@ from fastapi import FastAPI, Request
 from app.api.api_router import api_router
 from app.core.database import engine
 from app.core.errors import register_exception_handlers
+from app.core.logging import configure_logging
 from app.core.settings import settings
 
 logger = logging.getLogger("uvicorn.error")
@@ -26,6 +27,8 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
 
 def create_app() -> FastAPI:
     """创建并组装 FastAPI 应用。"""
+
+    configure_logging(settings)
 
     application = FastAPI(
         title=settings.app_name,

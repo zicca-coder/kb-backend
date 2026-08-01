@@ -1,3 +1,7 @@
+import asyncio
+import json
+from typing import AsyncIterator
+
 from fastapi.testclient import TestClient
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -18,6 +22,10 @@ from app.schemas.openclaw import (
     AgentRuntimeEnsureReadyResult,
     OpenClawChatResult,
 )
+from app.services.chat_stream_manager import (
+    ChatStreamStatus,
+    chat_stream_manager,
+)
 
 REGISTER_URL = "/api/auth/register"
 LOGIN_URL = "/api/auth/login"
@@ -31,11 +39,16 @@ class RecordingOpenClawClient:
         self,
         exc: Exception | None = None,
         readiness: AgentRuntimeEnsureReadyResult | None = None,
+        stream_deltas: list[str] | None = None,
+        stream_exc: Exception | None = None,
     ) -> None:
         self.exc = exc
         self.readiness = readiness
+        self.stream_deltas = stream_deltas or ["知识库", "回答"]
+        self.stream_exc = stream_exc
         self.provision_calls: list[str] = []
         self.chat_calls: list[tuple[str, str, str]] = []
+        self.stream_calls: list[tuple[str, str, str]] = []
         self.readiness_calls: list[str] = []
 
     async def provision_agent(
@@ -58,6 +71,19 @@ class RecordingOpenClawClient:
         if self.exc is not None:
             raise self.exc
         return OpenClawChatResult(answer="知识库回答")
+
+    async def stream_chat_completion(
+        self,
+        *,
+        agent_id: str,
+        openclaw_user: str,
+        message: str,
+    ) -> AsyncIterator[str]:
+        self.stream_calls.append((agent_id, openclaw_user, message))
+        for delta in self.stream_deltas:
+            yield delta
+        if self.stream_exc is not None:
+            raise self.stream_exc
 
     async def ensure_agent_runtime_ready(
         self,
@@ -116,6 +142,24 @@ def _authorization(token: str) -> dict[str, str]:
     return {"Authorization": f"Bearer {token}"}
 
 
+def _run_async(awaitable):
+    return asyncio.run(awaitable)
+
+
+def _parse_sse_events(text: str) -> list[tuple[str, dict[str, object]]]:
+    events: list[tuple[str, dict[str, object]]] = []
+    for block in text.strip().split("\n\n"):
+        event_name = ""
+        data = ""
+        for line in block.splitlines():
+            if line.startswith("event: "):
+                event_name = line.removeprefix("event: ")
+            if line.startswith("data: "):
+                data = line.removeprefix("data: ")
+        events.append((event_name, json.loads(data)))
+    return events
+
+
 def _stored_agent(db_session: Session, user_id: str) -> UserAgent:
     return db_session.execute(
         select(UserAgent).where(UserAgent.user_id == int(user_id))
@@ -168,6 +212,126 @@ def test_chat_success_uses_current_users_ready_agent(
     assert TEST_TOKEN not in str(result)
 
 
+def test_chat_stream_false_keeps_sync_response_structure(
+    client: TestClient,
+    db_session: Session,
+) -> None:
+    openclaw_client = RecordingOpenClawClient()
+    _install_openclaw_client(client, openclaw_client)
+    user = _register(client, username="chat_stream_false", phone="13800138401")
+    _set_agent(
+        db_session,
+        str(user["id"]),
+        agent_id="web-user-stream-false",
+        provision_status="ready",
+    )
+    token = _login(client, username="chat_stream_false")
+
+    response = client.post(
+        CHAT_URL,
+        headers=_authorization(token),
+        json={"message": "你好", "stream": False},
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "code": 200,
+        "msg": "success",
+        "detail": "chat success",
+        "data": {"answer": "知识库回答"},
+    }
+    assert openclaw_client.chat_calls == [
+        ("web-user-stream-false", str(user["id"]), "你好")
+    ]
+    assert openclaw_client.stream_calls == []
+
+
+def test_chat_stream_true_returns_sse_start_delta_done_and_cleans_record(
+    client: TestClient,
+    db_session: Session,
+) -> None:
+    openclaw_client = RecordingOpenClawClient(
+        stream_deltas=["第一段", "第二段"],
+    )
+    _install_openclaw_client(client, openclaw_client)
+    user = _register(client, username="chat_stream_true", phone="13800138402")
+    _set_agent(
+        db_session,
+        str(user["id"]),
+        agent_id="web-user-stream",
+        provision_status="ready",
+    )
+    token = _login(client, username="chat_stream_true")
+    active_before = _run_async(chat_stream_manager.active_count())
+
+    response = client.post(
+        CHAT_URL,
+        headers=_authorization(token),
+        json={"message": "你好", "stream": True},
+    )
+
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("text/event-stream")
+    assert response.headers["cache-control"] == "no-cache"
+    assert response.headers["x-accel-buffering"] == "no"
+    events = _parse_sse_events(response.text)
+    assert [event for event, _data in events] == [
+        "start",
+        "delta",
+        "delta",
+        "done",
+    ]
+    request_id = events[0][1]["request_id"]
+    assert isinstance(request_id, str)
+    assert all(data["request_id"] == request_id for _event, data in events)
+    assert events[1][1]["content"] == "第一段"
+    assert events[2][1]["content"] == "第二段"
+    assert events[3][1]["finish_reason"] == "stop"
+    assert openclaw_client.stream_calls == [
+        ("web-user-stream", str(user["id"]), "你好")
+    ]
+    assert _run_async(chat_stream_manager.active_count()) == active_before
+
+
+def test_chat_stream_partial_output_then_error_event(
+    client: TestClient,
+    db_session: Session,
+) -> None:
+    openclaw_client = RecordingOpenClawClient(
+        stream_deltas=["部分内容"],
+        stream_exc=OpenClawConnectionError("connect failed"),
+    )
+    _install_openclaw_client(client, openclaw_client)
+    user = _register(client, username="chat_stream_error", phone="13800138403")
+    _set_agent(
+        db_session,
+        str(user["id"]),
+        agent_id="web-user-stream-error",
+        provision_status="ready",
+    )
+    token = _login(client, username="chat_stream_error")
+    active_before = _run_async(chat_stream_manager.active_count())
+
+    response = client.post(
+        CHAT_URL,
+        headers=_authorization(token),
+        json={"message": "你好", "stream": True},
+    )
+
+    assert response.status_code == 200
+    events = _parse_sse_events(response.text)
+    assert [event for event, _data in events] == [
+        "start",
+        "delta",
+        "error",
+    ]
+    assert events[1][1]["content"] == "部分内容"
+    assert events[2][1]["code"] == "OPENCLAW_STREAM_ERROR"
+    assert events[2][1]["message"] == "OpenClaw 服务不可用"
+    assert TEST_TOKEN not in response.text
+    assert _run_async(chat_stream_manager.active_count()) == active_before
+
+
 def test_chat_requires_authentication(
     client: TestClient,
     openclaw_calls: list[str],
@@ -176,6 +340,100 @@ def test_chat_requires_authentication(
 
     assert response.status_code == 401
     assert openclaw_calls == []
+
+
+def test_chat_cancel_requires_authentication(client: TestClient) -> None:
+    response = client.post("/api/chat/request-id/cancel")
+
+    assert response.status_code == 401
+
+
+def test_chat_cancel_does_not_reveal_other_users_request(
+    client: TestClient,
+    db_session: Session,
+) -> None:
+    openclaw_client = RecordingOpenClawClient()
+    _install_openclaw_client(client, openclaw_client)
+    user_a = _register(client, username="cancel_owner", phone="13800138404")
+    user_b = _register(client, username="cancel_other", phone="13800138405")
+    token_b = _login(client, username="cancel_other")
+    record = _run_async(chat_stream_manager.create(user_id=int(user_a["id"])))
+
+    response = client.post(
+        f"/api/chat/{record.request_id}/cancel",
+        headers=_authorization(token_b),
+    )
+
+    assert response.status_code == 404
+    assert response.json()["detail"] == "生成请求不存在"
+    _run_async(
+        chat_stream_manager.finish(
+            request_id=record.request_id,
+            status=ChatStreamStatus.CANCELLED,
+        )
+    )
+
+
+def test_chat_cancel_running_request_is_idempotent(
+    client: TestClient,
+    db_session: Session,
+) -> None:
+    openclaw_client = RecordingOpenClawClient()
+    _install_openclaw_client(client, openclaw_client)
+    user = _register(client, username="cancel_running", phone="13800138406")
+    token = _login(client, username="cancel_running")
+    record = _run_async(chat_stream_manager.create(user_id=int(user["id"])))
+
+    first = client.post(
+        f"/api/chat/{record.request_id}/cancel",
+        headers=_authorization(token),
+    )
+    second = client.post(
+        f"/api/chat/{record.request_id}/cancel",
+        headers=_authorization(token),
+    )
+
+    assert first.status_code == 200
+    assert first.json()["data"] == {
+        "request_id": record.request_id,
+        "status": "cancelling",
+    }
+    assert second.status_code == 200
+    assert second.json()["data"]["status"] == "cancelling"
+    _run_async(
+        chat_stream_manager.finish(
+            request_id=record.request_id,
+            status=ChatStreamStatus.CANCELLED,
+        )
+    )
+
+
+def test_chat_cancel_completed_request_returns_completed_without_500(
+    client: TestClient,
+    db_session: Session,
+) -> None:
+    openclaw_client = RecordingOpenClawClient()
+    _install_openclaw_client(client, openclaw_client)
+    user = _register(client, username="cancel_completed", phone="13800138407")
+    token = _login(client, username="cancel_completed")
+    record = _run_async(chat_stream_manager.create(user_id=int(user["id"])))
+    _run_async(
+        chat_stream_manager.finish(
+            request_id=record.request_id,
+            status=ChatStreamStatus.COMPLETED,
+        )
+    )
+
+    response = client.post(
+        f"/api/chat/{record.request_id}/cancel",
+        headers=_authorization(token),
+    )
+
+    assert response.status_code == 200
+    assert response.json()["data"] == {
+        "request_id": record.request_id,
+        "status": "completed",
+    }
 
 
 def test_chat_rejects_client_supplied_agent_id(

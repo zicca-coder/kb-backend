@@ -1,6 +1,6 @@
 import asyncio
 import os
-from collections.abc import AsyncGenerator, Generator
+from collections.abc import AsyncGenerator, AsyncIterator, Generator
 from pathlib import Path
 
 import pytest
@@ -172,6 +172,15 @@ def client(
                 refreshed=True,
                 retryAfterMs=0,
             )
+
+        async def stream_chat_completion(
+            self,
+            *,
+            agent_id: str,
+            openclaw_user: str,
+            message: str,
+        ) -> AsyncIterator[str]:
+            yield "测试回答"
 
     application.dependency_overrides[get_db] = override_get_db
     application.dependency_overrides[get_openclaw_client] = (

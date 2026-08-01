@@ -76,6 +76,43 @@ def make_openclaw_client(
     )
 
 
+class ChunkedByteStream(httpx.AsyncByteStream):
+    def __init__(
+        self,
+        chunks: list[bytes],
+        exc: Exception | None = None,
+    ) -> None:
+        self.chunks = chunks
+        self.exc = exc
+        self.closed = False
+
+    async def __aiter__(self):
+        for chunk in self.chunks:
+            yield chunk
+        if self.exc is not None:
+            raise self.exc
+
+    async def aclose(self) -> None:
+        self.closed = True
+
+
+def chat_stream_event(content: str) -> bytes:
+    payload = {
+        "choices": [
+            {
+                "delta": {
+                    "content": content,
+                }
+            }
+        ]
+    }
+    return (
+        "data: "
+        + json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+        + "\n\n"
+    ).encode()
+
+
 @pytest.mark.parametrize("status_code", [200, 201])
 def test_provision_agent_parses_minimal_success_response(
     status_code: int,
@@ -455,6 +492,148 @@ def test_chat_completion_request_format_uses_agent_model_and_user_id() -> None:
         "stream": False,
     }
     assert body["user"] != "web-user-123"
+
+
+def test_stream_chat_completion_request_format_and_delta_order() -> None:
+    seen_requests: list[httpx.Request] = []
+    stream = ChunkedByteStream(
+        [
+            chat_stream_event("第一段"),
+            chat_stream_event(" second"),
+            b"data: [DONE]\n\n",
+        ]
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen_requests.append(request)
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            stream=stream,
+        )
+
+    async def scenario() -> list[str]:
+        async with make_async_client(handler) as http_client:
+            return [
+                delta
+                async for delta in make_openclaw_client(
+                    http_client
+                ).stream_chat_completion(
+                    agent_id="web-user-123",
+                    openclaw_user=SNOWFLAKE_ID,
+                    message="你好",
+                )
+            ]
+
+    assert run_async(scenario()) == ["第一段", " second"]
+    assert stream.closed is True
+    body = json.loads(seen_requests[0].content.decode())
+    assert seen_requests[0].method == "POST"
+    assert seen_requests[0].url.path == CHAT_COMPLETIONS_PATH
+    assert body == {
+        "model": "openclaw/web-user-123",
+        "user": SNOWFLAKE_ID,
+        "messages": [{"role": "user", "content": "你好"}],
+        "stream": True,
+    }
+
+
+def test_stream_chat_completion_handles_utf8_across_chunks() -> None:
+    event = chat_stream_event("中文跨 chunk")
+    split_at = event.index("文".encode("utf-8"))
+    stream = ChunkedByteStream(
+        [
+            event[:split_at],
+            event[split_at:split_at + 1],
+            event[split_at + 1:],
+            b"data: [DONE]\n\n",
+        ]
+    )
+
+    async def scenario() -> list[str]:
+        async with make_async_client(
+            lambda _request: httpx.Response(
+                200,
+                headers={"content-type": "text/event-stream"},
+                stream=stream,
+            ),
+        ) as http_client:
+            return [
+                delta
+                async for delta in make_openclaw_client(
+                    http_client
+                ).stream_chat_completion(
+                    agent_id="web-user-123",
+                    openclaw_user=SNOWFLAKE_ID,
+                    message="你好",
+                )
+            ]
+
+    assert run_async(scenario()) == ["中文跨 chunk"]
+    assert stream.closed is True
+
+
+def test_stream_chat_completion_partial_output_then_invalid_event_closes() -> None:
+    stream = ChunkedByteStream(
+        [
+            chat_stream_event("已输出"),
+            b"data: {not-json}\n\n",
+        ]
+    )
+
+    async def scenario() -> list[str]:
+        deltas: list[str] = []
+        async with make_async_client(
+            lambda _request: httpx.Response(
+                200,
+                headers={"content-type": "text/event-stream"},
+                stream=stream,
+            ),
+        ) as http_client:
+            with pytest.raises(OpenClawResponseError):
+                async for delta in make_openclaw_client(
+                    http_client
+                ).stream_chat_completion(
+                    agent_id="web-user-123",
+                    openclaw_user=SNOWFLAKE_ID,
+                    message="你好",
+                ):
+                    deltas.append(delta)
+        return deltas
+
+    assert run_async(scenario()) == ["已输出"]
+    assert stream.closed is True
+
+
+def test_stream_chat_completion_cancel_closes_upstream_response() -> None:
+    stream = ChunkedByteStream(
+        [
+            chat_stream_event("开始"),
+            chat_stream_event("不会读取"),
+        ]
+    )
+
+    async def scenario() -> str:
+        async with make_async_client(
+            lambda _request: httpx.Response(
+                200,
+                headers={"content-type": "text/event-stream"},
+                stream=stream,
+            ),
+        ) as http_client:
+            generator = make_openclaw_client(
+                http_client
+            ).stream_chat_completion(
+                agent_id="web-user-123",
+                openclaw_user=SNOWFLAKE_ID,
+                message="你好",
+            )
+            first = await anext(generator)
+            await generator.aclose()
+            return first
+
+    assert run_async(scenario()) == "开始"
+    assert stream.closed is True
 
 
 def test_chat_completion_ignores_extra_response_fields() -> None:

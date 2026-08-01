@@ -1,4 +1,4 @@
-from typing import Annotated
+from typing import Annotated, AsyncIterator
 
 from fastapi import Depends
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
@@ -49,6 +49,16 @@ class UnavailableOpenClawClient:
         message: str,
     ) -> OpenClawChatResult:
         raise OpenClawConfigurationError(self.message)
+
+    async def stream_chat_completion(
+        self,
+        *,
+        agent_id: str,
+        openclaw_user: str,
+        message: str,
+    ) -> AsyncIterator[str]:
+        raise OpenClawConfigurationError(self.message)
+        yield
 
     async def ensure_agent_runtime_ready(
         self,

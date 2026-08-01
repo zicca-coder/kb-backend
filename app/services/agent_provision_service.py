@@ -87,6 +87,12 @@ class AgentProvisioningService:
         manual_retry: bool,
     ) -> tuple[UserAgent, bool]:
         try:
+            logger.debug(
+                "Agent创建流程准备锁定用户Agent记录，user_id=%s, "
+                "manual_retry=%s",
+                user_id,
+                manual_retry,
+            )
             user_agent = await self.repository.get_by_user_id_for_update(
                 user_id,
             )
@@ -111,6 +117,11 @@ class AgentProvisioningService:
                 ProvisionStatus.WARMING,
                 ProvisionStatus.READY,
             ):
+                logger.debug(
+                    "Agent创建流程无需重复创建，user_id=%s, status=%s",
+                    user_id,
+                    current_status.value,
+                )
                 await self.db.commit()
                 return user_agent, False
 
@@ -132,6 +143,10 @@ class AgentProvisioningService:
             user_agent.provision_error = None
             user_agent.updated_by = SYSTEM_ACTOR
             await self.db.commit()
+            logger.debug(
+                "Agent创建流程已标记为创建中，user_id=%s",
+                user_id,
+            )
             return user_agent, True
         except (ResourceConflictError, ResourceNotFoundError):
             raise
@@ -148,6 +163,11 @@ class AgentProvisioningService:
         readiness: AgentRuntimeEnsureReadyResult | None,
     ) -> UserAgent:
         try:
+            logger.debug(
+                "Agent创建成功收尾开始，user_id=%s, agent_id=%s",
+                user_id,
+                result.agent_id,
+            )
             user_agent = await self.repository.get_by_user_id_for_update(
                 user_id,
             )
@@ -177,6 +197,11 @@ class AgentProvisioningService:
             user_agent.updated_by = SYSTEM_ACTOR
             await self.db.commit()
             await self.db.refresh(user_agent)
+            logger.debug(
+                "Agent创建成功收尾完成，user_id=%s, status=%s",
+                user_id,
+                user_agent.provision_status,
+            )
             logger.info(
                 "Agent provisioning succeeded, user_id=%s, agent_id=%s, "
                 "status=%s, agent_ready=%s",
@@ -205,6 +230,10 @@ class AgentProvisioningService:
         error_message: str,
     ) -> UserAgent:
         try:
+            logger.debug(
+                "Agent创建失败收尾开始，user_id=%s",
+                user_id,
+            )
             user_agent = await self.repository.get_by_user_id_for_update(
                 user_id,
             )
@@ -220,6 +249,10 @@ class AgentProvisioningService:
             user_agent.updated_by = SYSTEM_ACTOR
             await self.db.commit()
             await self.db.refresh(user_agent)
+            logger.debug(
+                "Agent创建失败收尾完成，user_id=%s",
+                user_id,
+            )
             logger.info(
                 "Agent provisioning failed, user_id=%s, error_type=%s",
                 user_id,
@@ -255,6 +288,11 @@ class AgentProvisioningService:
         agent_id: str,
     ) -> AgentRuntimeEnsureReadyResult | None:
         try:
+            logger.debug(
+                "Agent运行时预热检查开始，user_id=%s, agent_id=%s",
+                user_id,
+                agent_id,
+            )
             readiness = await self.openclaw_client.ensure_agent_runtime_ready(
                 agent_id=agent_id,
             )
@@ -267,6 +305,12 @@ class AgentProvisioningService:
                 type(exc).__name__,
             )
             return None
+        logger.debug(
+            "Agent运行时预热检查完成，user_id=%s, agent_id=%s, ready=%s",
+            user_id,
+            agent_id,
+            readiness.ready,
+        )
         logger.info(
             "OpenClaw Agent runtime warm-up checked after provisioning, "
             "user_id=%s, agent_id=%s, ready=%s, refreshed=%s, reason=%s, "
@@ -286,19 +330,40 @@ class AgentProvisioningService:
         user_id: int,
         manual_retry: bool = False,
     ) -> UserAgent:
+        logger.debug(
+            "Agent创建流程开始，user_id=%s, manual_retry=%s",
+            user_id,
+            manual_retry,
+        )
         user_agent, should_provision = await self._mark_provisioning(
             user_id=user_id,
             manual_retry=manual_retry,
         )
         if not should_provision:
+            logger.debug(
+                "Agent创建流程结束，使用现有记录，user_id=%s, status=%s",
+                user_id,
+                user_agent.provision_status,
+            )
             return user_agent
 
         try:
+            logger.debug("准备调用OpenClaw创建Agent，user_id=%s", user_id)
             result = await self.openclaw_client.provision_agent(
                 external_user_id=str(user_id),
             )
+            logger.debug(
+                "OpenClaw创建Agent调用完成，user_id=%s, agent_id=%s",
+                user_id,
+                result.agent_id,
+            )
         except OpenClawError as exc:
             error_message = sanitize_openclaw_error(exc)
+            logger.debug(
+                "OpenClaw创建Agent调用失败，user_id=%s, error_type=%s",
+                user_id,
+                type(exc).__name__,
+            )
             return await self._finish_failure(
                 user_id=user_id,
                 error_message=error_message,

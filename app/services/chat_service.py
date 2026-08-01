@@ -1,7 +1,7 @@
 import logging
 from time import perf_counter
 from dataclasses import dataclass
-from typing import Protocol
+from typing import AsyncIterator, Protocol
 
 from fastapi import status
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -44,6 +44,15 @@ class ChatClient(Protocol):
     ) -> OpenClawChatResult:
         ...
 
+    async def stream_chat_completion(
+        self,
+        *,
+        agent_id: str,
+        openclaw_user: str,
+        message: str,
+    ) -> AsyncIterator[str]:
+        ...
+
     async def ensure_agent_runtime_ready(
         self,
         *,
@@ -57,6 +66,14 @@ class ChatResult:
     answer: str
 
 
+@dataclass(frozen=True, slots=True)
+class PreparedChatRequest:
+    user_id: int
+    agent_id: str
+    openclaw_user: str
+    message: str
+
+
 class ChatService:
     def __init__(
         self,
@@ -68,14 +85,20 @@ class ChatService:
         self.openclaw_client = openclaw_client
         self.repository = repository or UserAgentRepository(db)
 
-    async def chat_for_user(
+    async def prepare_chat_for_user(
         self,
         *,
         user_id: int,
         message: str,
-    ) -> ChatResult:
+    ) -> PreparedChatRequest:
+        logger.debug(
+            "聊天请求准备开始，user_id=%s, message_length=%s",
+            user_id,
+            len(message),
+        )
         user_agent = await self.repository.get_by_user_id(user_id)
         if user_agent is None:
+            logger.debug("聊天请求准备失败，用户未绑定Agent，user_id=%s", user_id)
             raise ResourceNotFoundError(
                 code="user_agent_not_found",
                 message="当前用户 Agent 绑定不存在",
@@ -97,18 +120,29 @@ class ChatService:
             ) from exc
 
         agent_id = user_agent.agent_id.strip() if user_agent.agent_id else ""
+        logger.debug(
+            "聊天请求读取到Agent绑定，user_id=%s, user_agent_id=%s, "
+            "provision_status=%s, agent_id_present=%s",
+            user_id,
+            user_agent.id,
+            provision_status.value,
+            bool(agent_id),
+        )
 
         if provision_status == ProvisionStatus.PENDING:
+            logger.debug("聊天请求准备失败，Agent尚未创建，user_id=%s", user_id)
             raise ResourceConflictError(
                 code="agent_not_ready",
                 message="Agent 尚未创建完成",
             )
         if provision_status == ProvisionStatus.PROVISIONING:
+            logger.debug("聊天请求准备失败，Agent创建中，user_id=%s", user_id)
             raise ResourceConflictError(
                 code="agent_provisioning",
                 message="Agent 正在创建中，请稍后重试",
             )
         if provision_status == ProvisionStatus.FAILED:
+            logger.debug("聊天请求准备失败，Agent创建失败，user_id=%s", user_id)
             raise ResourceConflictError(
                 code="agent_provision_failed",
                 message="Agent 创建失败，请先重新创建 Agent",
@@ -128,24 +162,59 @@ class ChatService:
             )
 
         if provision_status != ProvisionStatus.READY:
+            logger.debug(
+                "聊天请求准备调用Agent运行时就绪检查，user_id=%s, "
+                "agent_id=%s, provision_status=%s",
+                user_id,
+                agent_id,
+                provision_status.value,
+            )
             await self._ensure_agent_ready(
                 user_id=user_id,
                 agent_id=agent_id,
             )
 
+        logger.debug(
+            "聊天请求准备完成，user_id=%s, agent_id=%s",
+            user_id,
+            agent_id,
+        )
+        return PreparedChatRequest(
+            user_id=user_id,
+            agent_id=agent_id,
+            openclaw_user=str(user_id),
+            message=message,
+        )
+
+    async def chat_for_user(
+        self,
+        *,
+        user_id: int,
+        message: str,
+    ) -> ChatResult:
+        prepared = await self.prepare_chat_for_user(
+            user_id=user_id,
+            message=message,
+        )
+
         logger.info(
             "OpenClaw chat requested, user_id=%s, agent_id=%s, "
             "message_length=%s",
             user_id,
-            agent_id,
+            prepared.agent_id,
             len(message),
         )
         started_at = perf_counter()
         try:
+            logger.debug(
+                "同步聊天准备调用OpenClaw，user_id=%s, agent_id=%s",
+                user_id,
+                prepared.agent_id,
+            )
             result = await self.openclaw_client.chat_completion(
-                agent_id=agent_id,
-                openclaw_user=str(user_id),
-                message=message,
+                agent_id=prepared.agent_id,
+                openclaw_user=prepared.openclaw_user,
+                message=prepared.message,
             )
         except OpenClawRuntimeNotReadyError as exc:
             await self._mark_runtime_not_ready(user_id=user_id)
@@ -154,24 +223,83 @@ class ChatService:
                 message="Agent runtime is not ready yet, please retry later",
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
                 details={
-                    "agent_id": agent_id,
+                    "agent_id": prepared.agent_id,
                     "provision_status": ProvisionStatus.WARMING.value,
                     "retry_after_ms": DEFAULT_AGENT_RETRY_AFTER_MS,
                 },
             ) from exc
         except OpenClawError as exc:
-            raise self._map_openclaw_error(exc, agent_id=agent_id) from exc
+            raise self._map_openclaw_error(
+                exc,
+                agent_id=prepared.agent_id,
+            ) from exc
 
         logger.info(
             "OpenClaw chat response, user_id=%s, agent_id=%s, "
             "elapsed_ms=%s, answer_length=%s, answer_preview=%r",
             user_id,
-            agent_id,
+            prepared.agent_id,
             round((perf_counter() - started_at) * 1000),
             len(result.answer),
             result.answer[:CHAT_ANSWER_LOG_PREVIEW_CHARS],
         )
+        logger.debug(
+            "同步聊天OpenClaw调用完成，user_id=%s, agent_id=%s, "
+            "answer_length=%s",
+            user_id,
+            prepared.agent_id,
+            len(result.answer),
+        )
         return ChatResult(answer=result.answer)
+
+    async def stream_prepared_chat(
+        self,
+        *,
+        prepared: PreparedChatRequest,
+    ) -> AsyncIterator[str]:
+        logger.info(
+            "OpenClaw stream chat requested, user_id=%s, agent_id=%s, "
+            "message_length=%s",
+            prepared.user_id,
+            prepared.agent_id,
+            len(prepared.message),
+        )
+        try:
+            logger.debug(
+                "流式聊天准备调用OpenClaw，user_id=%s, agent_id=%s",
+                prepared.user_id,
+                prepared.agent_id,
+            )
+            async for delta in self.openclaw_client.stream_chat_completion(
+                agent_id=prepared.agent_id,
+                openclaw_user=prepared.openclaw_user,
+                message=prepared.message,
+            ):
+                logger.debug(
+                    "流式聊天收到OpenClaw增量，user_id=%s, agent_id=%s, "
+                    "delta_length=%s",
+                    prepared.user_id,
+                    prepared.agent_id,
+                    len(delta),
+                )
+                yield delta
+        except OpenClawRuntimeNotReadyError as exc:
+            await self._mark_runtime_not_ready(user_id=prepared.user_id)
+            raise AppError(
+                code="agent_runtime_not_ready",
+                message="Agent runtime is not ready yet, please retry later",
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                details={
+                    "agent_id": prepared.agent_id,
+                    "provision_status": ProvisionStatus.WARMING.value,
+                    "retry_after_ms": DEFAULT_AGENT_RETRY_AFTER_MS,
+                },
+            ) from exc
+        except OpenClawError as exc:
+            raise self._map_openclaw_error(
+                exc,
+                agent_id=prepared.agent_id,
+            ) from exc
 
     async def _ensure_agent_ready(
         self,

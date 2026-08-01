@@ -1,8 +1,9 @@
+import json
 import logging
 import re
 from dataclasses import dataclass
 from json import JSONDecodeError
-from typing import Any
+from typing import Any, AsyncIterator
 
 import httpx
 from pydantic import ValidationError
@@ -218,6 +219,70 @@ class OpenClawClient:
         )
         return result
 
+    async def stream_chat_completion(
+        self,
+        *,
+        agent_id: str,
+        openclaw_user: str,
+        message: str,
+    ) -> AsyncIterator[str]:
+        normalized_agent_id = self._normalize_agent_id(agent_id)
+        normalized_openclaw_user = self._normalize_openclaw_user(
+            openclaw_user,
+        )
+        normalized_message = self._normalize_chat_message(message)
+        payload = self._chat_payload(
+            agent_id=normalized_agent_id,
+            openclaw_user=normalized_openclaw_user,
+            message=normalized_message,
+            stream=True,
+        )
+
+        try:
+            if self._http_client is not None:
+                async with self._http_client.stream(
+                    "POST",
+                    self._chat_request_url(),
+                    headers=self._auth_headers(),
+                    json=payload,
+                    timeout=self._timeout,
+                ) as response:
+                    await self._raise_stream_chat_status(
+                        response,
+                        agent_id=normalized_agent_id,
+                    )
+                    async for delta in self._iter_chat_stream(response):
+                        yield delta
+            else:
+                async with httpx.AsyncClient(
+                    base_url=self._base_url,
+                    timeout=self._timeout,
+                ) as client:
+                    async with client.stream(
+                        "POST",
+                        CHAT_COMPLETIONS_PATH,
+                        headers=self._auth_headers(),
+                        json=payload,
+                    ) as response:
+                        await self._raise_stream_chat_status(
+                            response,
+                            agent_id=normalized_agent_id,
+                        )
+                        async for delta in self._iter_chat_stream(response):
+                            yield delta
+        except httpx.TimeoutException as exc:
+            raise OpenClawTimeoutError(
+                "Backend timed out while reading OpenClaw stream",
+            ) from exc
+        except (httpx.ConnectError, httpx.NetworkError) as exc:
+            raise OpenClawConnectionError(
+                "Unable to connect to OpenClaw Gateway",
+            ) from exc
+        except httpx.RequestError as exc:
+            raise OpenClawConnectionError(
+                "OpenClaw Gateway stream request failed",
+            ) from exc
+
     async def ensure_agent_runtime_ready(
         self,
         *,
@@ -415,6 +480,26 @@ class OpenClawClient:
     def _auth_headers(self) -> dict[str, str]:
         return {"Authorization": f"Bearer {self._gateway_token}"}
 
+    @staticmethod
+    def _chat_payload(
+        *,
+        agent_id: str,
+        openclaw_user: str,
+        message: str,
+        stream: bool,
+    ) -> dict[str, Any]:
+        return {
+            "model": f"openclaw/{agent_id}",
+            "user": openclaw_user,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": message,
+                }
+            ],
+            "stream": stream,
+        }
+
     def _raise_for_status(
         self,
         status_code: int,
@@ -496,6 +581,21 @@ class OpenClawClient:
             )
         raise OpenClawResponseError(
             f"OpenClaw chat failed with HTTP {status_code}",
+        )
+
+    async def _raise_stream_chat_status(
+        self,
+        response: httpx.Response,
+        *,
+        agent_id: str,
+    ) -> None:
+        if response.status_code == 200:
+            return
+        await response.aread()
+        self._raise_chat_status(
+            response.status_code,
+            agent_id=agent_id,
+            response=response,
         )
 
     def _raise_admin_rpc_status(
@@ -605,6 +705,99 @@ class OpenClawClient:
             )
 
         return OpenClawChatResult(answer=content)
+
+    async def _iter_chat_stream(
+        self,
+        response: httpx.Response,
+    ) -> AsyncIterator[str]:
+        buffer = ""
+        async for chunk in response.aiter_text():
+            if not chunk:
+                continue
+            buffer += chunk.replace("\r\n", "\n").replace("\r", "\n")
+            while "\n\n" in buffer:
+                raw_event, buffer = buffer.split("\n\n", 1)
+                done, deltas = self._parse_chat_stream_event(raw_event)
+                if done:
+                    return
+                for delta in deltas:
+                    yield delta
+
+        if buffer.strip():
+            done, deltas = self._parse_chat_stream_event(buffer)
+            if done:
+                return
+            for delta in deltas:
+                yield delta
+
+    @staticmethod
+    def _parse_chat_stream_event(raw_event: str) -> tuple[bool, list[str]]:
+        normalized_event = raw_event.replace("\r\n", "\n").replace("\r", "\n")
+        data_lines: list[str] = []
+        for line in normalized_event.split("\n"):
+            if not line or line.startswith(":"):
+                continue
+            if not line.startswith("data:"):
+                continue
+            value = line[5:]
+            if value.startswith(" "):
+                value = value[1:]
+            data_lines.append(value)
+
+        if not data_lines:
+            return False, []
+
+        raw_data = "\n".join(data_lines)
+        if raw_data == "[DONE]":
+            return True, []
+
+        try:
+            data: Any = json.loads(raw_data)
+        except (JSONDecodeError, ValueError) as exc:
+            raise OpenClawResponseError(
+                "OpenClaw returned an invalid stream event",
+            ) from exc
+
+        if not isinstance(data, dict):
+            raise OpenClawResponseError(
+                "OpenClaw returned an invalid stream event",
+            )
+
+        error = data.get("error")
+        if isinstance(error, dict):
+            raise OpenClawResponseError(
+                "OpenClaw stream returned an error event",
+            )
+        if error is not None:
+            raise OpenClawResponseError(
+                "OpenClaw stream returned an error event",
+            )
+
+        choices = data.get("choices")
+        if not isinstance(choices, list):
+            raise OpenClawResponseError(
+                "OpenClaw returned an invalid stream event",
+            )
+
+        deltas: list[str] = []
+        for choice in choices:
+            if not isinstance(choice, dict):
+                raise OpenClawResponseError(
+                    "OpenClaw returned an invalid stream event",
+                )
+            delta = choice.get("delta")
+            if isinstance(delta, dict):
+                content = delta.get("content")
+                if isinstance(content, str) and content:
+                    deltas.append(content)
+                continue
+            message = choice.get("message")
+            if isinstance(message, dict):
+                content = message.get("content")
+                if isinstance(content, str) and content:
+                    deltas.append(content)
+
+        return False, deltas
 
     @staticmethod
     def _parse_agent_runtime_ready_response(

@@ -1,5 +1,5 @@
 from functools import lru_cache
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import Field, SecretStr, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -16,12 +16,27 @@ class Settings(BaseSettings):
     app_port: int = 8000
     docs_url: str = "/docs"
     redoc_url: str = "/redoc"
+    log_level: Literal[
+        "DEBUG",
+        "INFO",
+        "WARNING",
+        "ERROR",
+        "CRITICAL",
+    ] = "INFO"
+    sqlalchemy_log_level: Literal[
+        "DEBUG",
+        "INFO",
+        "WARNING",
+        "ERROR",
+        "CRITICAL",
+    ] = "WARNING"
 
     db_host: str = "127.0.0.1"
     db_port: int = 3306
     db_name: str
     db_user: str
     db_password: SecretStr
+    sql_echo: bool = False
 
     jwt_secret_key: SecretStr
     jwt_algorithm: Literal["HS256"] = "HS256"
@@ -51,6 +66,13 @@ class Settings(BaseSettings):
         if not normalized:
             raise ValueError("openclaw_base_url cannot be empty")
         return normalized
+
+    @field_validator("log_level", "sqlalchemy_log_level", mode="before")
+    @classmethod
+    def normalize_log_level(cls, value: Any) -> Any:
+        if isinstance(value, str):
+            return value.strip().upper()
+        return value
 
     @property
     def database_url(self) -> URL:

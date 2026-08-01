@@ -1,6 +1,6 @@
 from typing import Annotated
 
-from pydantic import BaseModel, ConfigDict, StringConstraints
+from pydantic import BaseModel, ConfigDict, StrictBool, StringConstraints
 
 ChatMessage = Annotated[
     str,
@@ -12,7 +12,13 @@ class ChatRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     message: ChatMessage
+    stream: StrictBool = False
 
 
 class ChatResponse(BaseModel):
     answer: str
+
+
+class ChatCancelResponse(BaseModel):
+    request_id: str
+    status: str
