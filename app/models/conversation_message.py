@@ -1,3 +1,5 @@
+from typing import TYPE_CHECKING
+
 from sqlalchemy import ForeignKey, Index, String, Text, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -7,6 +9,9 @@ from app.core.conversations import (
 )
 from app.models.base import Base
 from app.models.mixins import AuditMixin, BigIntIdMixin
+
+if TYPE_CHECKING:
+    from app.models.message_attachment import MessageAttachment
 
 
 class ConversationMessage(BigIntIdMixin, AuditMixin, Base):
@@ -91,4 +96,11 @@ class ConversationMessage(BigIntIdMixin, AuditMixin, Base):
         "Conversation",
         back_populates="messages",
         lazy="selectin",
+    )
+    attachment_links: Mapped[list["MessageAttachment"]] = relationship(
+        "MessageAttachment",
+        back_populates="message",
+        cascade="all, delete-orphan",
+        lazy="selectin",
+        order_by="MessageAttachment.sort_order",
     )

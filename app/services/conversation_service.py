@@ -23,7 +23,9 @@ from app.core.errors import (
 )
 from app.models.conversation import Conversation
 from app.models.conversation_message import ConversationMessage
+from app.models.message_attachment import MessageAttachment
 from app.repository.conversation_repository import ConversationRepository
+from app.repository.attachment_repository import AttachmentRepository
 
 SYSTEM_ACTOR = "system"
 
@@ -118,6 +120,15 @@ class ConversationService:
             conversation_id=conversation_id,
         )
 
+    async def list_message_attachment_links(
+        self,
+        *,
+        message_ids: list[int],
+    ):
+        return await AttachmentRepository(self.db).list_for_message_ids(
+            message_ids=message_ids,
+        )
+
     async def update_title(
         self,
         *,
@@ -174,6 +185,7 @@ class ConversationService:
         user_content: str,
         request_id: str | None,
         assistant_status: ConversationMessageStatus,
+        attachment_ids: list[str] | None = None,
     ) -> ChatMessagePair:
         now = self._now()
         try:
@@ -226,6 +238,18 @@ class ConversationService:
             conversation.updated_by = SYSTEM_ACTOR
             await self.repository.add_message(user_message)
             await self.repository.add_message(assistant_message)
+            if attachment_ids:
+                self.db.add_all(
+                    [
+                        MessageAttachment(
+                            message_id=user_message.id,
+                            attachment_id=attachment_id,
+                            sort_order=index,
+                        )
+                        for index, attachment_id in enumerate(attachment_ids)
+                    ]
+                )
+                await self.db.flush()
             await self._commit()
             await self.db.refresh(conversation)
             await self.db.refresh(user_message)

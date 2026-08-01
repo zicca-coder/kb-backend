@@ -1,7 +1,7 @@
 import logging
 from dataclasses import dataclass
 from time import perf_counter
-from typing import AsyncIterator, Protocol
+from typing import Any, AsyncIterator, Literal, Protocol
 from uuid import uuid4
 
 from fastapi import status
@@ -28,6 +28,7 @@ from app.core.provisioning import (
 )
 from app.repository.conversation_repository import ConversationRepository
 from app.repository.user_agent_repository import UserAgentRepository
+from app.services.attachment_service import AttachmentService
 from app.schemas.openclaw import (
     AgentRuntimeEnsureReadyResult,
     OpenClawChatResult,
@@ -46,6 +47,7 @@ class ChatClient(Protocol):
         openclaw_user: str,
         message: str,
         session_key: str | None = None,
+        content_parts: list[dict[str, Any]] | None = None,
     ) -> OpenClawChatResult:
         ...
 
@@ -55,6 +57,27 @@ class ChatClient(Protocol):
         agent_id: str,
         openclaw_user: str,
         message: str,
+        session_key: str | None = None,
+        content_parts: list[dict[str, Any]] | None = None,
+    ) -> AsyncIterator[str]:
+        ...
+
+    async def responses_completion(
+        self,
+        *,
+        agent_id: str,
+        openclaw_user: str,
+        content_parts: list[dict[str, Any]],
+        session_key: str | None = None,
+    ) -> OpenClawChatResult:
+        ...
+
+    async def stream_responses_completion(
+        self,
+        *,
+        agent_id: str,
+        openclaw_user: str,
+        content_parts: list[dict[str, Any]],
         session_key: str | None = None,
     ) -> AsyncIterator[str]:
         ...
@@ -81,6 +104,10 @@ class PreparedChatRequest:
     session_key: str
     conversation_id: str | None = None
     assistant_message_id: int | None = None
+    content_parts: list[dict[str, Any]] | None = None
+    openclaw_endpoint: Literal["chat_completions", "responses"] = (
+        "chat_completions"
+    )
 
 
 class ChatService:
@@ -90,6 +117,7 @@ class ChatService:
         openclaw_client: ChatClient,
         repository: UserAgentRepository | None = None,
         conversation_service: ConversationService | None = None,
+        attachment_service: AttachmentService | None = None,
     ) -> None:
         self.db = db
         self.openclaw_client = openclaw_client
@@ -101,6 +129,7 @@ class ChatService:
                 repository=ConversationRepository(db),
             )
         )
+        self.attachment_service = attachment_service
 
     async def prepare_chat_for_user(
         self,
@@ -109,12 +138,48 @@ class ChatService:
         message: str,
         conversation_id: str | None = None,
         request_id: str | None = None,
+        attachment_ids: list[str] | None = None,
     ) -> PreparedChatRequest:
+        attachment_ids = attachment_ids or []
+        if not message and not attachment_ids:
+            raise AppError(
+                code="chat_message_empty",
+                message="消息和附件不能同时为空",
+                status_code=status.HTTP_400_BAD_REQUEST,
+            )
         logger.debug(
             "聊天请求准备开始，user_id=%s, message_length=%s",
             user_id,
             len(message),
         )
+        attachments = []
+        content_parts = None
+        openclaw_endpoint: Literal["chat_completions", "responses"] = (
+            "chat_completions"
+        )
+        if attachment_ids:
+            attachment_service = self.attachment_service or AttachmentService(self.db)
+            attachments = await attachment_service.validate_chat_attachments(
+                user_id=user_id,
+                attachment_ids=attachment_ids,
+                conversation_id=conversation_id,
+            )
+            if attachment_service.requires_responses_endpoint(attachments):
+                openclaw_endpoint = "responses"
+                content_parts = await (
+                    attachment_service.build_openclaw_responses_content_parts(
+                        message=message,
+                        attachments=attachments,
+                    )
+                )
+            else:
+                content_parts = (
+                    await attachment_service.build_openclaw_chat_content_parts(
+                        message=message,
+                        attachments=attachments,
+                    )
+                )
+
         user_agent = await self.repository.get_by_user_id(user_id)
         if user_agent is None:
             logger.debug("聊天请求准备失败，用户未绑定Agent，user_id=%s", user_id)
@@ -205,6 +270,7 @@ class ChatService:
                     if request_id is not None
                     else ConversationMessageStatus.PENDING
                 ),
+                attachment_ids=[attachment.id for attachment in attachments],
             )
             assistant_message_id = pair.assistant_message.id
 
@@ -224,6 +290,8 @@ class ChatService:
             ),
             conversation_id=conversation_id,
             assistant_message_id=assistant_message_id,
+            content_parts=content_parts,
+            openclaw_endpoint=openclaw_endpoint,
         )
 
     async def chat_for_user(
@@ -232,11 +300,13 @@ class ChatService:
         user_id: int,
         message: str,
         conversation_id: str | None = None,
+        attachment_ids: list[str] | None = None,
     ) -> ChatResult:
         prepared = await self.prepare_chat_for_user(
             user_id=user_id,
             message=message,
             conversation_id=conversation_id,
+            attachment_ids=attachment_ids,
         )
 
         logger.info(
@@ -253,12 +323,28 @@ class ChatService:
                 user_id,
                 prepared.agent_id,
             )
-            result = await self.openclaw_client.chat_completion(
-                agent_id=prepared.agent_id,
-                openclaw_user=prepared.openclaw_user,
-                message=prepared.message,
-                session_key=prepared.session_key,
-            )
+            if prepared.content_parts is None:
+                result = await self.openclaw_client.chat_completion(
+                    agent_id=prepared.agent_id,
+                    openclaw_user=prepared.openclaw_user,
+                    message=prepared.message,
+                    session_key=prepared.session_key,
+                )
+            elif prepared.openclaw_endpoint == "responses":
+                result = await self.openclaw_client.responses_completion(
+                    agent_id=prepared.agent_id,
+                    openclaw_user=prepared.openclaw_user,
+                    content_parts=prepared.content_parts,
+                    session_key=prepared.session_key,
+                )
+            else:
+                result = await self.openclaw_client.chat_completion(
+                    agent_id=prepared.agent_id,
+                    openclaw_user=prepared.openclaw_user,
+                    message=prepared.message,
+                    session_key=prepared.session_key,
+                    content_parts=prepared.content_parts,
+                )
         except OpenClawRuntimeNotReadyError as exc:
             await self._finalize_prepared_error(
                 prepared=prepared,
@@ -326,12 +412,29 @@ class ChatService:
                 prepared.user_id,
                 prepared.agent_id,
             )
-            async for delta in self.openclaw_client.stream_chat_completion(
-                agent_id=prepared.agent_id,
-                openclaw_user=prepared.openclaw_user,
-                message=prepared.message,
-                session_key=prepared.session_key,
-            ):
+            if prepared.content_parts is None:
+                stream = self.openclaw_client.stream_chat_completion(
+                    agent_id=prepared.agent_id,
+                    openclaw_user=prepared.openclaw_user,
+                    message=prepared.message,
+                    session_key=prepared.session_key,
+                )
+            elif prepared.openclaw_endpoint == "responses":
+                stream = self.openclaw_client.stream_responses_completion(
+                    agent_id=prepared.agent_id,
+                    openclaw_user=prepared.openclaw_user,
+                    content_parts=prepared.content_parts,
+                    session_key=prepared.session_key,
+                )
+            else:
+                stream = self.openclaw_client.stream_chat_completion(
+                    agent_id=prepared.agent_id,
+                    openclaw_user=prepared.openclaw_user,
+                    message=prepared.message,
+                    session_key=prepared.session_key,
+                    content_parts=prepared.content_parts,
+                )
+            async for delta in stream:
                 logger.debug(
                     "流式聊天收到OpenClaw增量，user_id=%s, agent_id=%s, "
                     "delta_length=%s",

@@ -28,6 +28,7 @@ logger = logging.getLogger(__name__)
 
 PROVISION_PATH = "/api/internal/agent-provisioner/provision"
 CHAT_COMPLETIONS_PATH = "/v1/chat/completions"
+RESPONSES_PATH = "/v1/responses"
 ADMIN_RPC_PATH = "/api/v1/admin/rpc"
 ENSURE_AGENT_RUNTIME_READY_METHOD = "agents.runtime.ensureReady"
 EXTERNAL_USER_ID_PATTERN = re.compile(r"^[1-9][0-9]*$")
@@ -41,6 +42,11 @@ DEFAULT_CONNECT_TIMEOUT_SECONDS = 10.0
 DEFAULT_READ_TIMEOUT_SECONDS = 120.0
 DEFAULT_WRITE_TIMEOUT_SECONDS = 30.0
 DEFAULT_POOL_TIMEOUT_SECONDS = 10.0
+RESPONSES_ATTACHMENT_INSTRUCTIONS = (
+    "你必须基于用户消息和附件内容给出可见回答。"
+    "不要空回复，不要使用 NO_REPLY。"
+    "如果附件内容无法解析，请明确说明无法解析的文件名和原因。"
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -159,18 +165,23 @@ class OpenClawClient:
         openclaw_user: str,
         message: str,
         session_key: str | None = None,
+        content_parts: list[dict[str, Any]] | None = None,
     ) -> OpenClawChatResult:
         normalized_agent_id = self._normalize_agent_id(agent_id)
         normalized_openclaw_user = self._normalize_openclaw_user(
             openclaw_user,
         )
-        normalized_message = self._normalize_chat_message(message)
+        normalized_message = self._normalize_chat_message(
+            message,
+            allow_empty=content_parts is not None,
+        )
         normalized_session_key = self._normalize_session_key(session_key)
         payload = self._chat_payload(
             agent_id=normalized_agent_id,
             openclaw_user=normalized_openclaw_user,
             message=normalized_message,
             stream=False,
+            content_parts=content_parts,
         )
 
         try:
@@ -227,18 +238,23 @@ class OpenClawClient:
         openclaw_user: str,
         message: str,
         session_key: str | None = None,
+        content_parts: list[dict[str, Any]] | None = None,
     ) -> AsyncIterator[str]:
         normalized_agent_id = self._normalize_agent_id(agent_id)
         normalized_openclaw_user = self._normalize_openclaw_user(
             openclaw_user,
         )
-        normalized_message = self._normalize_chat_message(message)
+        normalized_message = self._normalize_chat_message(
+            message,
+            allow_empty=content_parts is not None,
+        )
         normalized_session_key = self._normalize_session_key(session_key)
         payload = self._chat_payload(
             agent_id=normalized_agent_id,
             openclaw_user=normalized_openclaw_user,
             message=normalized_message,
             stream=True,
+            content_parts=content_parts,
         )
 
         try:
@@ -276,6 +292,137 @@ class OpenClawClient:
                             agent_id=normalized_agent_id,
                         )
                         async for delta in self._iter_chat_stream(response):
+                            yield delta
+        except httpx.TimeoutException as exc:
+            raise OpenClawTimeoutError(
+                "Backend timed out while reading OpenClaw stream",
+            ) from exc
+        except (httpx.ConnectError, httpx.NetworkError) as exc:
+            raise OpenClawConnectionError(
+                "Unable to connect to OpenClaw Gateway",
+            ) from exc
+        except httpx.RequestError as exc:
+            raise OpenClawConnectionError(
+                "OpenClaw Gateway stream request failed",
+            ) from exc
+
+    async def responses_completion(
+        self,
+        *,
+        agent_id: str,
+        openclaw_user: str,
+        content_parts: list[dict[str, Any]],
+        session_key: str | None = None,
+    ) -> OpenClawChatResult:
+        normalized_agent_id = self._normalize_agent_id(agent_id)
+        normalized_openclaw_user = self._normalize_openclaw_user(
+            openclaw_user,
+        )
+        normalized_session_key = self._normalize_session_key(session_key)
+        payload = self._responses_payload(
+            agent_id=normalized_agent_id,
+            openclaw_user=normalized_openclaw_user,
+            content_parts=content_parts,
+            stream=False,
+        )
+
+        try:
+            if self._http_client is not None:
+                response = await self._http_client.post(
+                    self._responses_request_url(),
+                    headers=self._chat_headers(
+                        session_key=normalized_session_key,
+                    ),
+                    json=payload,
+                    timeout=self._timeout,
+                )
+            else:
+                async with httpx.AsyncClient(
+                    base_url=self._base_url,
+                    timeout=self._timeout,
+                ) as client:
+                    response = await client.post(
+                        RESPONSES_PATH,
+                        headers=self._chat_headers(
+                            session_key=normalized_session_key,
+                        ),
+                        json=payload,
+                    )
+        except httpx.TimeoutException as exc:
+            raise OpenClawTimeoutError(
+                "Backend timed out while waiting for OpenClaw Gateway",
+            ) from exc
+        except (httpx.ConnectError, httpx.NetworkError) as exc:
+            raise OpenClawConnectionError(
+                "Unable to connect to OpenClaw Gateway",
+            ) from exc
+        except httpx.RequestError as exc:
+            raise OpenClawConnectionError(
+                "OpenClaw Gateway request failed",
+            ) from exc
+
+        self._raise_chat_status(
+            response.status_code,
+            agent_id=normalized_agent_id,
+            response=response,
+        )
+        return self._parse_responses_response(response)
+
+    async def stream_responses_completion(
+        self,
+        *,
+        agent_id: str,
+        openclaw_user: str,
+        content_parts: list[dict[str, Any]],
+        session_key: str | None = None,
+    ) -> AsyncIterator[str]:
+        normalized_agent_id = self._normalize_agent_id(agent_id)
+        normalized_openclaw_user = self._normalize_openclaw_user(
+            openclaw_user,
+        )
+        normalized_session_key = self._normalize_session_key(session_key)
+        payload = self._responses_payload(
+            agent_id=normalized_agent_id,
+            openclaw_user=normalized_openclaw_user,
+            content_parts=content_parts,
+            stream=True,
+        )
+
+        try:
+            if self._http_client is not None:
+                async with self._http_client.stream(
+                    "POST",
+                    self._responses_request_url(),
+                    headers=self._chat_headers(
+                        session_key=normalized_session_key,
+                    ),
+                    json=payload,
+                    timeout=self._timeout,
+                ) as response:
+                    await self._raise_stream_chat_status(
+                        response,
+                        agent_id=normalized_agent_id,
+                    )
+                    async for delta in self._iter_responses_stream(response):
+                        yield delta
+            else:
+                async with httpx.AsyncClient(
+                    base_url=self._base_url,
+                    timeout=self._timeout,
+                ) as client:
+                    async with client.stream(
+                        "POST",
+                        RESPONSES_PATH,
+                        headers=self._chat_headers(
+                            session_key=normalized_session_key,
+                        ),
+                        json=payload,
+                    ) as response:
+                        await self._raise_stream_chat_status(
+                            response,
+                            agent_id=normalized_agent_id,
+                        )
+                        async for delta in self._iter_responses_stream(response):
                             yield delta
         except httpx.TimeoutException as exc:
             raise OpenClawTimeoutError(
@@ -467,11 +614,15 @@ class OpenClawClient:
         return normalized
 
     @staticmethod
-    def _normalize_chat_message(message: str) -> str:
+    def _normalize_chat_message(
+        message: str,
+        *,
+        allow_empty: bool = False,
+    ) -> str:
         if not isinstance(message, str):
             raise OpenClawRequestError("message must be a non-empty string")
         normalized = message.strip()
-        if not normalized:
+        if not normalized and not allow_empty:
             raise OpenClawRequestError("message must be a non-empty string")
         return normalized
 
@@ -480,6 +631,9 @@ class OpenClawClient:
 
     def _chat_request_url(self) -> str:
         return f"{self._base_url}{CHAT_COMPLETIONS_PATH}"
+
+    def _responses_request_url(self) -> str:
+        return f"{self._base_url}{RESPONSES_PATH}"
 
     def _admin_rpc_request_url(self) -> str:
         return f"{self._base_url}{ADMIN_RPC_PATH}"
@@ -500,14 +654,44 @@ class OpenClawClient:
         openclaw_user: str,
         message: str,
         stream: bool,
+        content_parts: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
+        content: str | list[dict[str, Any]] = (
+            content_parts if content_parts is not None else message
+        )
         return {
             "model": f"openclaw/{agent_id}",
             "user": openclaw_user,
             "messages": [
                 {
                     "role": "user",
-                    "content": message,
+                    "content": content,
+                }
+            ],
+            "stream": stream,
+        }
+
+    @staticmethod
+    def _responses_payload(
+        *,
+        agent_id: str,
+        openclaw_user: str,
+        content_parts: list[dict[str, Any]],
+        stream: bool,
+    ) -> dict[str, Any]:
+        if not content_parts:
+            raise OpenClawRequestError(
+                "responses content_parts must not be empty",
+            )
+        return {
+            "model": f"openclaw/{agent_id}",
+            "user": openclaw_user,
+            "instructions": RESPONSES_ATTACHMENT_INSTRUCTIONS,
+            "input": [
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": content_parts,
                 }
             ],
             "stream": stream,
@@ -738,6 +922,62 @@ class OpenClawClient:
 
         return OpenClawChatResult(answer=content)
 
+    @classmethod
+    def _parse_responses_response(
+        cls,
+        response: httpx.Response,
+    ) -> OpenClawChatResult:
+        try:
+            data: Any = response.json()
+        except (JSONDecodeError, ValueError) as exc:
+            raise OpenClawResponseError(
+                "OpenClaw returned an invalid JSON response",
+            ) from exc
+
+        if not isinstance(data, dict):
+            raise OpenClawResponseError(
+                "OpenClaw returned an invalid response format",
+            )
+
+        output_text = data.get("output_text")
+        if isinstance(output_text, str) and output_text.strip():
+            return OpenClawChatResult(answer=output_text)
+
+        extracted = cls._extract_responses_output_text(data)
+        if extracted.strip():
+            return OpenClawChatResult(answer=extracted)
+
+        try:
+            return cls._parse_chat_response(response)
+        except OpenClawResponseError as exc:
+            raise OpenClawResponseError(
+                "OpenClaw returned an empty response",
+            ) from exc
+
+    async def _iter_responses_stream(
+        self,
+        response: httpx.Response,
+    ) -> AsyncIterator[str]:
+        buffer = ""
+        async for chunk in response.aiter_text():
+            if not chunk:
+                continue
+            buffer += chunk.replace("\r\n", "\n").replace("\r", "\n")
+            while "\n\n" in buffer:
+                raw_event, buffer = buffer.split("\n\n", 1)
+                done, deltas = self._parse_responses_stream_event(raw_event)
+                if done:
+                    return
+                for delta in deltas:
+                    yield delta
+
+        if buffer.strip():
+            done, deltas = self._parse_responses_stream_event(buffer)
+            if done:
+                return
+            for delta in deltas:
+                yield delta
+
     async def _iter_chat_stream(
         self,
         response: httpx.Response,
@@ -830,6 +1070,105 @@ class OpenClawClient:
                     deltas.append(content)
 
         return False, deltas
+
+    @classmethod
+    def _parse_responses_stream_event(
+        cls,
+        raw_event: str,
+    ) -> tuple[bool, list[str]]:
+        normalized_event = raw_event.replace("\r\n", "\n").replace("\r", "\n")
+        event_name = ""
+        data_lines: list[str] = []
+        for line in normalized_event.split("\n"):
+            if not line or line.startswith(":"):
+                continue
+            if line.startswith("event:"):
+                event_name = line[6:].strip()
+                continue
+            if not line.startswith("data:"):
+                continue
+            value = line[5:]
+            if value.startswith(" "):
+                value = value[1:]
+            data_lines.append(value)
+
+        if event_name in {
+            "response.completed",
+            "response.done",
+            "done",
+        }:
+            return True, []
+        if not data_lines:
+            return False, []
+
+        raw_data = "\n".join(data_lines)
+        if raw_data == "[DONE]":
+            return True, []
+
+        try:
+            data: Any = json.loads(raw_data)
+        except (JSONDecodeError, ValueError) as exc:
+            raise OpenClawResponseError(
+                "OpenClaw returned an invalid stream event",
+            ) from exc
+
+        if not isinstance(data, dict):
+            raise OpenClawResponseError(
+                "OpenClaw returned an invalid stream event",
+            )
+
+        error = data.get("error")
+        if error is not None:
+            raise OpenClawResponseError(
+                "OpenClaw stream returned an error event",
+            )
+
+        event_type = data.get("type")
+        if event_type in {
+            "response.completed",
+            "response.done",
+            "done",
+        }:
+            return True, []
+
+        deltas: list[str] = []
+        delta = data.get("delta")
+        if isinstance(delta, str) and delta:
+            deltas.append(delta)
+
+        text = data.get("text")
+        if isinstance(text, str) and text:
+            deltas.append(text)
+
+        if not deltas:
+            try:
+                _done, chat_deltas = cls._parse_chat_stream_event(raw_event)
+                deltas.extend(chat_deltas)
+            except OpenClawResponseError:
+                pass
+
+        return False, deltas
+
+    @classmethod
+    def _extract_responses_output_text(cls, data: dict[str, Any]) -> str:
+        parts: list[str] = []
+        output = data.get("output")
+        if not isinstance(output, list):
+            return ""
+
+        for item in output:
+            if not isinstance(item, dict):
+                continue
+            content = item.get("content")
+            if not isinstance(content, list):
+                continue
+            for content_item in content:
+                if not isinstance(content_item, dict):
+                    continue
+                text = content_item.get("text")
+                if isinstance(text, str) and text:
+                    parts.append(text)
+        return "".join(parts)
 
     @staticmethod
     def _parse_agent_runtime_ready_response(

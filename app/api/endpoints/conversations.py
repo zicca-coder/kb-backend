@@ -15,6 +15,7 @@ from app.schemas.conversation_message import (
     ConversationMessageList,
     ConversationMessageRead,
 )
+from app.schemas.attachment import AttachmentRead
 from app.schemas.response import ApiResponse, success_response
 
 logger = logging.getLogger(__name__)
@@ -96,10 +97,20 @@ async def list_conversation_messages(
         conversation_id=conversation_id,
         user_id=current_user.id,
     )
+    attachment_links = await service.list_message_attachment_links(
+        message_ids=[message.id for message in messages],
+    )
     return success_response(
         data=ConversationMessageList(
             items=[
-                ConversationMessageRead.model_validate(message)
+                ConversationMessageRead.from_message(
+                    message,
+                    attachments=[
+                        AttachmentRead.from_attachment(link.attachment)
+                        for link in attachment_links.get(message.id, [])
+                        if not link.attachment.is_deleted
+                    ],
+                )
                 for message in messages
             ]
         ),

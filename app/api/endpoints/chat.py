@@ -61,6 +61,7 @@ async def chat(
                 message=payload.message,
                 conversation_id=payload.conversation_id,
                 request_id=record.request_id,
+                attachment_ids=payload.attachment_ids,
             )
         except Exception:
             await chat_stream_manager.finish(
@@ -90,6 +91,7 @@ async def chat(
         user_id=current_user.id,
         message=payload.message,
         conversation_id=payload.conversation_id,
+        attachment_ids=payload.attachment_ids,
     )
     logger.debug("聊天接口同步模式调用完成，user_id=%s", current_user.id)
     return success_response(

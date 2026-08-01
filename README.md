@@ -45,6 +45,8 @@ Copy-Item .env.example .env
 alembic upgrade head
 ```
 
+聊天附件功能会创建 `attachments` 和 `message_attachments` 表。文件二进制只保存到私有 MinIO bucket，数据库只保存元数据和消息关联。
+
 `upgrade` 用于空数据库。如果数据库中已经存在与当前模型一致的 `users` 表，应先核对表结构，然后仅登记迁移基线：
 
 ```powershell
@@ -71,6 +73,63 @@ uvicorn app.main:app --reload
 - 存活检查：`http://127.0.0.1:8000/health/live`
 - 就绪检查：`http://127.0.0.1:8000/health/ready`
 - User API：`http://127.0.0.1:8000/api/v1/users`
+
+## 聊天附件
+
+先上传附件，再在聊天请求里引用返回的 `attachment_id`：
+
+```http
+POST /api/attachments
+Authorization: Bearer <token>
+Content-Type: multipart/form-data
+
+file=<binary>
+conversation_id=<optional uuid>
+purpose=chat_attachment
+```
+
+成功响应的 `data.preview_url` 为 `/api/attachments/{attachment_id}/content`。MinIO bucket 必须保持私有，后端会在内容接口中鉴权后转发文件内容。
+
+支持图片 `.jpg`、`.jpeg`、`.png`、`.webp`，文档 `.pdf`、`.txt`、`.md`、`.csv`、`.json`、`.html`、`.htm`。默认限制：单张图片 10 MB、单个文档 5 MB、单条消息最多 4 个附件、附件总大小 15 MB。
+
+OpenClaw 调用策略：
+
+- 无附件或仅图片附件：继续走 `/v1/chat/completions`。图片以 `image_url.url = data:<mime>;base64,...` 传入。
+- 文本类附件 `.txt`、`.md`、`.csv`、`.json`、`.html`、`.htm`：后端从 MinIO 读取并解码为文本，作为 `/v1/chat/completions` 的 `text` 段内联传入。
+- PDF 附件：后端从 MinIO 读取后先用 `pypdf` 抽取前若干页文本，再作为 `/v1/chat/completions` 的 `text` 段内联传入；如果抽到的文字太少，再用 `PyMuPDF` 把前几页渲染成 PNG，并以 `image_url` 一并发给视觉模型。
+- 不向 OpenClaw 传 MinIO URL，后端始终从私有 MinIO 读取 bytes 后转 Base64。
+
+聊天请求示例：
+
+```json
+{
+  "conversation_id": "00000000-0000-0000-0000-000000000000",
+  "message": "请分析这张图片",
+  "attachment_ids": ["attachment-uuid"],
+  "stream": true
+}
+```
+
+新增配置：
+
+```env
+MINIO_ENDPOINT=127.0.0.1:9000
+MINIO_ACCESS_KEY=minioadmin
+MINIO_SECRET_KEY=minioadmin
+MINIO_BUCKET_CHAT_ATTACHMENTS=chat-attachments
+MINIO_SECURE=false
+MINIO_REGION=
+ATTACHMENT_IMAGE_MAX_SIZE=10485760
+ATTACHMENT_DOCUMENT_MAX_SIZE=5242880
+ATTACHMENT_TOTAL_MAX_SIZE=15728640
+ATTACHMENT_MAX_COUNT=4
+ATTACHMENT_IMAGE_MAX_PIXELS=40000000
+ATTACHMENT_INLINE_TEXT_MAX_CHARS=60000
+ATTACHMENT_PDF_MAX_PAGES=20
+ATTACHMENT_PDF_TEXT_MIN_CHARS=120
+ATTACHMENT_PDF_RENDER_MAX_PAGES=3
+ATTACHMENT_PDF_RENDER_ZOOM=1.5
+```
 
 ## 测试
 

@@ -1,4 +1,4 @@
-from typing import Annotated, AsyncIterator
+from typing import Annotated, Any, AsyncIterator
 
 from fastapi import Depends
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
@@ -16,6 +16,7 @@ from app.services.agent_provision_service import (
     AgentProvisionClient,
     AgentProvisioningService,
 )
+from app.services.attachment_service import AttachmentService
 from app.services.auth_service import AuthService
 from app.services.chat_service import ChatService
 from app.services.conversation_service import ConversationService
@@ -49,6 +50,7 @@ class UnavailableOpenClawClient:
         openclaw_user: str,
         message: str,
         session_key: str | None = None,
+        content_parts: list[dict[str, Any]] | None = None,
     ) -> OpenClawChatResult:
         raise OpenClawConfigurationError(self.message)
 
@@ -58,6 +60,28 @@ class UnavailableOpenClawClient:
         agent_id: str,
         openclaw_user: str,
         message: str,
+        session_key: str | None = None,
+        content_parts: list[dict[str, Any]] | None = None,
+    ) -> AsyncIterator[str]:
+        raise OpenClawConfigurationError(self.message)
+        yield
+
+    async def responses_completion(
+        self,
+        *,
+        agent_id: str,
+        openclaw_user: str,
+        content_parts: list[dict[str, Any]],
+        session_key: str | None = None,
+    ) -> OpenClawChatResult:
+        raise OpenClawConfigurationError(self.message)
+
+    async def stream_responses_completion(
+        self,
+        *,
+        agent_id: str,
+        openclaw_user: str,
+        content_parts: list[dict[str, Any]],
         session_key: str | None = None,
     ) -> AsyncIterator[str]:
         raise OpenClawConfigurationError(self.message)
@@ -145,11 +169,28 @@ AgentProvisioningServiceDependency = Annotated[
 ]
 
 
+async def get_attachment_service(
+    db: DatabaseDependency,
+) -> AttachmentService:
+    return AttachmentService(db)
+
+
+AttachmentServiceDependency = Annotated[
+    AttachmentService,
+    Depends(get_attachment_service),
+]
+
+
 async def get_chat_service(
     db: DatabaseDependency,
     openclaw_client: OpenClawClientDependency,
+    attachment_service: AttachmentServiceDependency,
 ) -> ChatService:
-    return ChatService(db, openclaw_client)
+    return ChatService(
+        db,
+        openclaw_client,
+        attachment_service=attachment_service,
+    )
 
 
 ChatServiceDependency = Annotated[
@@ -215,6 +256,7 @@ CurrentUser = Annotated[User, Depends(get_current_user)]
 
 __all__ = [
     "AuthServiceDependency",
+    "AttachmentServiceDependency",
     "ChatServiceDependency",
     "ConversationServiceDependency",
     "CurrentUser",

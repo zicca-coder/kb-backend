@@ -13,6 +13,8 @@ from app.clients.openclaw_client import (
     ENSURE_AGENT_RUNTIME_READY_METHOD,
     OpenClawClient,
     PROVISION_PATH,
+    RESPONSES_PATH,
+    RESPONSES_ATTACHMENT_INSTRUCTIONS,
 )
 from app.core.errors import (
     OpenClawAuthenticationError,
@@ -107,6 +109,19 @@ def chat_stream_event(content: str) -> bytes:
         ]
     }
     return (
+        "data: "
+        + json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+        + "\n\n"
+    ).encode()
+
+
+def responses_stream_event(content: str) -> bytes:
+    payload = {
+        "type": "response.output_text.delta",
+        "delta": content,
+    }
+    return (
+        "event: response.output_text.delta\n"
         "data: "
         + json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
         + "\n\n"
@@ -563,6 +578,105 @@ def test_stream_chat_completion_request_format_and_delta_order() -> None:
         "messages": [{"role": "user", "content": "你好"}],
         "stream": True,
     }
+
+
+def test_responses_completion_request_format_and_response() -> None:
+    seen_requests: list[httpx.Request] = []
+    content_parts = [
+        {"type": "input_text", "text": "请分析文件"},
+        {
+            "type": "input_file",
+            "source": {
+                "type": "base64",
+                "media_type": "application/json",
+                "filename": "data.json",
+                "data": "eyJvayI6dHJ1ZX0=",
+            },
+        },
+    ]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen_requests.append(request)
+        return httpx.Response(
+            200,
+            json={"output_text": "文件内容是 JSON"},
+        )
+
+    async def scenario() -> str:
+        async with make_async_client(handler) as http_client:
+            result = await make_openclaw_client(
+                http_client,
+            ).responses_completion(
+                agent_id="web-user-123",
+                openclaw_user=SNOWFLAKE_ID,
+                content_parts=content_parts,
+                session_key="webchat:file-123",
+            )
+            return result.answer
+
+    assert run_async(scenario()) == "文件内容是 JSON"
+    request = seen_requests[0]
+    body = json.loads(request.content.decode())
+    assert request.method == "POST"
+    assert request.url.path == RESPONSES_PATH
+    assert request.headers["x-openclaw-session-key"] == "webchat:file-123"
+    assert body == {
+        "model": "openclaw/web-user-123",
+        "user": SNOWFLAKE_ID,
+        "instructions": RESPONSES_ATTACHMENT_INSTRUCTIONS,
+        "input": [
+            {
+                "type": "message",
+                "role": "user",
+                "content": content_parts,
+            }
+        ],
+        "stream": False,
+    }
+
+
+def test_stream_responses_completion_request_format_and_delta_order() -> None:
+    seen_requests: list[httpx.Request] = []
+    content_parts = [{"type": "input_text", "text": "读文件"}]
+    stream = ChunkedByteStream(
+        [
+            responses_stream_event("第一段"),
+            responses_stream_event(" second"),
+            b"event: response.completed\ndata: {}\n\n",
+        ]
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen_requests.append(request)
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            stream=stream,
+        )
+
+    async def scenario() -> list[str]:
+        async with make_async_client(handler) as http_client:
+            return [
+                delta
+                async for delta in make_openclaw_client(
+                    http_client,
+                ).stream_responses_completion(
+                    agent_id="web-user-123",
+                    openclaw_user=SNOWFLAKE_ID,
+                    content_parts=content_parts,
+                    session_key="webchat:file-stream-123",
+                )
+            ]
+
+    assert run_async(scenario()) == ["第一段", " second"]
+    body = json.loads(seen_requests[0].content.decode())
+    assert seen_requests[0].url.path == RESPONSES_PATH
+    assert seen_requests[0].headers["x-openclaw-session-key"] == (
+        "webchat:file-stream-123"
+    )
+    assert body["input"][0]["content"] == content_parts
+    assert body["instructions"] == RESPONSES_ATTACHMENT_INSTRUCTIONS
+    assert body["stream"] is True
 
 
 def test_stream_chat_completion_handles_utf8_across_chunks() -> None:

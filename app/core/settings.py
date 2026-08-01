@@ -49,6 +49,33 @@ class Settings(BaseSettings):
     openclaw_write_timeout_seconds: float = Field(default=30, gt=0)
     openclaw_pool_timeout_seconds: float = Field(default=10, gt=0)
 
+    minio_endpoint: str = "127.0.0.1:9000"
+    minio_access_key: SecretStr = SecretStr("minioadmin")
+    minio_secret_key: SecretStr = SecretStr("minioadmin")
+    minio_bucket_chat_attachments: str = "chat-attachments"
+    minio_secure: bool = False
+    minio_region: str | None = None
+
+    attachment_image_max_size: int = Field(
+        default=10 * 1024 * 1024,
+        gt=0,
+    )
+    attachment_document_max_size: int = Field(
+        default=5 * 1024 * 1024,
+        gt=0,
+    )
+    attachment_total_max_size: int = Field(
+        default=15 * 1024 * 1024,
+        gt=0,
+    )
+    attachment_max_count: int = Field(default=4, gt=0)
+    attachment_image_max_pixels: int = Field(default=40_000_000, gt=0)
+    attachment_inline_text_max_chars: int = Field(default=60_000, gt=0)
+    attachment_pdf_max_pages: int = Field(default=20, gt=0)
+    attachment_pdf_text_min_chars: int = Field(default=120, ge=0)
+    attachment_pdf_render_max_pages: int = Field(default=3, gt=0)
+    attachment_pdf_render_zoom: float = Field(default=1.5, gt=0)
+
     snowflake_worker_id: int = Field(default=1, ge=0, le=1023)
     snowflake_epoch_ms: int = Field(default=1767225600000, gt=0)
 

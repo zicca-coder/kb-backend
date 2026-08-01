@@ -21,11 +21,15 @@ os.environ.setdefault(
 
 from app.core.database import get_db  # noqa: E402
 from app.main import create_app  # noqa: E402
-from app.api.dependencies import get_openclaw_client  # noqa: E402
+from app.api.dependencies import (  # noqa: E402
+    get_attachment_service,
+    get_openclaw_client,
+)
 from app.schemas.openclaw import (  # noqa: E402
     AgentProvisionResult,
     AgentRuntimeEnsureReadyResult,
 )
+from app.services.attachment_service import AttachmentService  # noqa: E402
 
 TEST_SCHEMA = """
 CREATE TABLE users (
@@ -96,6 +100,47 @@ CREATE TABLE conversation_messages (
 )
 """
 
+ATTACHMENT_SCHEMA = """
+CREATE TABLE attachments (
+    id VARCHAR(36) PRIMARY KEY,
+    user_id BIGINT NOT NULL,
+    conversation_id VARCHAR(36),
+    original_filename VARCHAR(255) NOT NULL,
+    bucket_name VARCHAR(128) NOT NULL,
+    object_key VARCHAR(512) NOT NULL UNIQUE,
+    content_type VARCHAR(128) NOT NULL,
+    detected_mime_type VARCHAR(128) NOT NULL,
+    extension VARCHAR(16) NOT NULL,
+    file_size BIGINT NOT NULL,
+    sha256 VARCHAR(64) NOT NULL,
+    category VARCHAR(32) NOT NULL,
+    purpose VARCHAR(64) NOT NULL DEFAULT 'chat_attachment',
+    status VARCHAR(32) NOT NULL DEFAULT 'uploading',
+    error_message TEXT,
+    is_deleted BOOLEAN NOT NULL DEFAULT 0,
+    created_by VARCHAR(64) NOT NULL DEFAULT 'system',
+    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_by VARCHAR(64) NOT NULL DEFAULT 'system',
+    updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (user_id) REFERENCES users(id),
+    FOREIGN KEY (conversation_id) REFERENCES conversations(id)
+)
+"""
+
+MESSAGE_ATTACHMENT_SCHEMA = """
+CREATE TABLE message_attachments (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    message_id INTEGER NOT NULL,
+    attachment_id VARCHAR(36) NOT NULL,
+    sort_order INTEGER NOT NULL,
+    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (message_id) REFERENCES conversation_messages(id),
+    FOREIGN KEY (attachment_id) REFERENCES attachments(id),
+    UNIQUE (message_id, attachment_id),
+    UNIQUE (message_id, sort_order)
+)
+"""
+
 
 @pytest.fixture(scope="session")
 def test_database_path(tmp_path_factory) -> Path:
@@ -112,6 +157,8 @@ def test_engine(test_database_path: Path):
         connection.execute(text(USER_AGENT_SCHEMA))
         connection.execute(text(CONVERSATION_SCHEMA))
         connection.execute(text(CONVERSATION_MESSAGE_SCHEMA))
+        connection.execute(text(ATTACHMENT_SCHEMA))
+        connection.execute(text(MESSAGE_ATTACHMENT_SCHEMA))
         connection.execute(
             text(
                 "CREATE INDEX ix_conversations_user_deleted_last_message "
@@ -122,6 +169,18 @@ def test_engine(test_database_path: Path):
             text(
                 "CREATE INDEX ix_conversation_messages_conversation_sequence "
                 "ON conversation_messages (conversation_id, sequence_no)"
+            )
+        )
+        connection.execute(
+            text(
+                "CREATE INDEX ix_attachments_user_status_deleted "
+                "ON attachments (user_id, status, is_deleted)"
+            )
+        )
+        connection.execute(
+            text(
+                "CREATE INDEX ix_message_attachments_attachment "
+                "ON message_attachments (attachment_id)"
             )
         )
     try:
@@ -154,12 +213,16 @@ def async_session_factory(
 @pytest.fixture(autouse=True)
 def clean_database(test_engine) -> Generator[None, None, None]:
     with test_engine.begin() as connection:
+        connection.execute(text("DELETE FROM message_attachments"))
+        connection.execute(text("DELETE FROM attachments"))
         connection.execute(text("DELETE FROM conversation_messages"))
         connection.execute(text("DELETE FROM conversations"))
         connection.execute(text("DELETE FROM user_agents"))
         connection.execute(text("DELETE FROM users"))
     yield
     with test_engine.begin() as connection:
+        connection.execute(text("DELETE FROM message_attachments"))
+        connection.execute(text("DELETE FROM attachments"))
         connection.execute(text("DELETE FROM conversation_messages"))
         connection.execute(text("DELETE FROM conversations"))
         connection.execute(text("DELETE FROM user_agents"))
@@ -190,10 +253,40 @@ def openclaw_calls() -> list[str]:
     return []
 
 
+class FakeStorageService:
+    def __init__(self) -> None:
+        self.bucket_name = "test-chat-attachments"
+        self.objects: dict[str, bytes] = {}
+        self.fail_put = False
+
+    async def put_object(
+        self,
+        *,
+        object_key: str,
+        data: bytes,
+        content_type: str,
+    ) -> None:
+        if self.fail_put:
+            raise RuntimeError("fake storage upload failed")
+        self.objects[object_key] = data
+
+    async def get_object_bytes(self, *, object_key: str) -> bytes:
+        return self.objects[object_key]
+
+    async def delete_object(self, *, object_key: str) -> None:
+        self.objects.pop(object_key, None)
+
+
+@pytest.fixture
+def fake_storage_service() -> FakeStorageService:
+    return FakeStorageService()
+
+
 @pytest.fixture
 def client(
     async_session_factory: async_sessionmaker[AsyncSession],
     openclaw_calls: list[str],
+    fake_storage_service: FakeStorageService,
 ) -> Generator[TestClient, None, None]:
     application = create_app()
 
@@ -236,9 +329,40 @@ def client(
         ) -> AsyncIterator[str]:
             yield "测试回答"
 
+        async def responses_completion(
+            self,
+            *,
+            agent_id: str,
+            openclaw_user: str,
+            content_parts: list[dict[str, object]],
+            session_key: str | None = None,
+        ):
+            return type("Result", (), {"answer": "测试回答"})()
+
+        async def stream_responses_completion(
+            self,
+            *,
+            agent_id: str,
+            openclaw_user: str,
+            content_parts: list[dict[str, object]],
+            session_key: str | None = None,
+        ) -> AsyncIterator[str]:
+            yield "测试回答"
+
     application.dependency_overrides[get_db] = override_get_db
     application.dependency_overrides[get_openclaw_client] = (
         lambda: FakeOpenClawClient()
+    )
+
+    async def attachment_service_dependency() -> AsyncGenerator[
+        AttachmentService,
+        None,
+    ]:
+        async with async_session_factory() as session:
+            yield AttachmentService(session, storage=fake_storage_service)
+
+    application.dependency_overrides[get_attachment_service] = (
+        attachment_service_dependency
     )
     with TestClient(application) as test_client:
         yield test_client
