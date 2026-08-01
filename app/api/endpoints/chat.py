@@ -49,11 +49,23 @@ async def chat(
     )
     if payload.stream:
         logger.debug("聊天接口准备进入流式模式，user_id=%s", current_user.id)
-        prepared = await service.prepare_chat_for_user(
+        record = await chat_stream_manager.create(
             user_id=current_user.id,
-            message=payload.message,
+            conversation_id=payload.conversation_id,
         )
-        record = await chat_stream_manager.create(user_id=current_user.id)
+        try:
+            prepared = await service.prepare_chat_for_user(
+                user_id=current_user.id,
+                message=payload.message,
+                conversation_id=payload.conversation_id,
+                request_id=record.request_id,
+            )
+        except Exception:
+            await chat_stream_manager.finish(
+                request_id=record.request_id,
+                status=ChatStreamStatus.FAILED,
+            )
+            raise
         logger.debug(
             "聊天接口流式请求准备完成，request_id=%s, user_id=%s",
             record.request_id,
@@ -75,6 +87,7 @@ async def chat(
     result = await service.chat_for_user(
         user_id=current_user.id,
         message=payload.message,
+        conversation_id=payload.conversation_id,
     )
     logger.debug("聊天接口同步模式调用完成，user_id=%s", current_user.id)
     return success_response(
@@ -127,6 +140,12 @@ async def _chat_event_stream(
 
     async def produce() -> None:
         try:
+            initial_status = await chat_stream_manager.get_status_for_user(
+                request_id=request_id,
+                user_id=user_id,
+            )
+            if initial_status == ChatStreamStatus.CANCELLING:
+                return
             async for delta in service.stream_prepared_chat(
                 prepared=prepared,
             ):

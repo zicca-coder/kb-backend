@@ -34,6 +34,7 @@ class RecordingChatClient:
         agent_id: str,
         openclaw_user: str,
         message: str,
+        session_key: str | None = None,
     ) -> OpenClawChatResult:
         self.calls.append((agent_id, openclaw_user, message))
         return OpenClawChatResult(answer="回答")

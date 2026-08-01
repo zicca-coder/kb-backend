@@ -494,6 +494,29 @@ def test_chat_completion_request_format_uses_agent_model_and_user_id() -> None:
     assert body["user"] != "web-user-123"
 
 
+def test_chat_completion_sends_explicit_openclaw_session_key() -> None:
+    seen_requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen_requests.append(request)
+        return httpx.Response(200, json=chat_response())
+
+    async def scenario() -> None:
+        async with make_async_client(handler) as http_client:
+            await make_openclaw_client(http_client).chat_completion(
+                agent_id="web-user-123",
+                openclaw_user=SNOWFLAKE_ID,
+                message="你好",
+                session_key="webchat:conv-123",
+            )
+
+    run_async(scenario())
+
+    assert seen_requests[0].headers["x-openclaw-session-key"] == (
+        "webchat:conv-123"
+    )
+
+
 def test_stream_chat_completion_request_format_and_delta_order() -> None:
     seen_requests: list[httpx.Request] = []
     stream = ChunkedByteStream(
@@ -522,6 +545,7 @@ def test_stream_chat_completion_request_format_and_delta_order() -> None:
                     agent_id="web-user-123",
                     openclaw_user=SNOWFLAKE_ID,
                     message="你好",
+                    session_key="webchat:conv-stream-123",
                 )
             ]
 
@@ -530,6 +554,9 @@ def test_stream_chat_completion_request_format_and_delta_order() -> None:
     body = json.loads(seen_requests[0].content.decode())
     assert seen_requests[0].method == "POST"
     assert seen_requests[0].url.path == CHAT_COMPLETIONS_PATH
+    assert seen_requests[0].headers["x-openclaw-session-key"] == (
+        "webchat:conv-stream-123"
+    )
     assert body == {
         "model": "openclaw/web-user-123",
         "user": SNOWFLAKE_ID,

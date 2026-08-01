@@ -23,6 +23,7 @@ from app.schemas.openclaw import (
     OpenClawChatResult,
 )
 from app.services.chat_stream_manager import (
+    ChatStreamManager,
     ChatStreamStatus,
     chat_stream_manager,
 )
@@ -49,6 +50,8 @@ class RecordingOpenClawClient:
         self.provision_calls: list[str] = []
         self.chat_calls: list[tuple[str, str, str]] = []
         self.stream_calls: list[tuple[str, str, str]] = []
+        self.chat_session_keys: list[str | None] = []
+        self.stream_session_keys: list[str | None] = []
         self.readiness_calls: list[str] = []
 
     async def provision_agent(
@@ -66,8 +69,10 @@ class RecordingOpenClawClient:
         agent_id: str,
         openclaw_user: str,
         message: str,
+        session_key: str | None = None,
     ) -> OpenClawChatResult:
         self.chat_calls.append((agent_id, openclaw_user, message))
+        self.chat_session_keys.append(session_key)
         if self.exc is not None:
             raise self.exc
         return OpenClawChatResult(answer="知识库回答")
@@ -78,8 +83,10 @@ class RecordingOpenClawClient:
         agent_id: str,
         openclaw_user: str,
         message: str,
+        session_key: str | None = None,
     ) -> AsyncIterator[str]:
         self.stream_calls.append((agent_id, openclaw_user, message))
+        self.stream_session_keys.append(session_key)
         for delta in self.stream_deltas:
             yield delta
         if self.stream_exc is not None:
@@ -209,7 +216,38 @@ def test_chat_success_uses_current_users_ready_agent(
     assert openclaw_client.chat_calls == [
         ("web-user-123", str(user["id"]), "你好")
     ]
+    assert len(openclaw_client.chat_session_keys) == 1
+    assert openclaw_client.chat_session_keys[0] is not None
+    assert openclaw_client.chat_session_keys[0].startswith("webchat:")
     assert TEST_TOKEN not in str(result)
+
+
+def test_chat_uses_conversation_id_as_openclaw_session_key(
+    client: TestClient,
+    db_session: Session,
+) -> None:
+    openclaw_client = RecordingOpenClawClient()
+    _install_openclaw_client(client, openclaw_client)
+    user = _register(client, username="chat_conversation", phone="13800138218")
+    _set_agent(
+        db_session,
+        str(user["id"]),
+        agent_id="web-user-conversation",
+        provision_status="ready",
+    )
+    token = _login(client, username="chat_conversation")
+
+    response = client.post(
+        CHAT_URL,
+        headers=_authorization(token),
+        json={"message": "你好", "conversation_id": "conv-123"},
+    )
+
+    assert response.status_code == 200
+    assert openclaw_client.chat_calls == [
+        ("web-user-conversation", str(user["id"]), "你好")
+    ]
+    assert openclaw_client.chat_session_keys == ["webchat:conv-123"]
 
 
 def test_chat_stream_false_keeps_sync_response_structure(
@@ -243,6 +281,9 @@ def test_chat_stream_false_keeps_sync_response_structure(
     assert openclaw_client.chat_calls == [
         ("web-user-stream-false", str(user["id"]), "你好")
     ]
+    assert len(openclaw_client.chat_session_keys) == 1
+    assert openclaw_client.chat_session_keys[0] is not None
+    assert openclaw_client.chat_session_keys[0].startswith("webchat:")
     assert openclaw_client.stream_calls == []
 
 
@@ -290,7 +331,48 @@ def test_chat_stream_true_returns_sse_start_delta_done_and_cleans_record(
     assert openclaw_client.stream_calls == [
         ("web-user-stream", str(user["id"]), "你好")
     ]
+    assert openclaw_client.stream_session_keys == [f"webchat:{request_id}"]
     assert _run_async(chat_stream_manager.active_count()) == active_before
+
+
+def test_chat_stream_uses_conversation_id_as_openclaw_session_key(
+    client: TestClient,
+    db_session: Session,
+) -> None:
+    openclaw_client = RecordingOpenClawClient(
+        stream_deltas=["第一段"],
+    )
+    _install_openclaw_client(client, openclaw_client)
+    user = _register(
+        client,
+        username="chat_stream_conversation",
+        phone="13800138408",
+    )
+    _set_agent(
+        db_session,
+        str(user["id"]),
+        agent_id="web-user-stream-conversation",
+        provision_status="ready",
+    )
+    token = _login(client, username="chat_stream_conversation")
+
+    response = client.post(
+        CHAT_URL,
+        headers=_authorization(token),
+        json={
+            "message": "你好",
+            "stream": True,
+            "conversation_id": "conv-stream-123",
+        },
+    )
+
+    assert response.status_code == 200
+    assert openclaw_client.stream_calls == [
+        ("web-user-stream-conversation", str(user["id"]), "你好")
+    ]
+    assert openclaw_client.stream_session_keys == [
+        "webchat:conv-stream-123"
+    ]
 
 
 def test_chat_stream_partial_output_then_error_event(
@@ -372,6 +454,88 @@ def test_chat_cancel_does_not_reveal_other_users_request(
             status=ChatStreamStatus.CANCELLED,
         )
     )
+
+
+def test_chat_stream_create_cancels_previous_same_conversation() -> None:
+    first = _run_async(
+        chat_stream_manager.create(
+            user_id=123,
+            conversation_id="same-conversation",
+        )
+    )
+    second = _run_async(
+        chat_stream_manager.create(
+            user_id=123,
+            conversation_id="same-conversation",
+        )
+    )
+
+    assert first.request_id != second.request_id
+    assert (
+        _run_async(
+            chat_stream_manager.get_status_for_user(
+                request_id=first.request_id,
+                user_id=123,
+            )
+        )
+        == ChatStreamStatus.CANCELLING
+    )
+    assert (
+        _run_async(
+            chat_stream_manager.get_status_for_user(
+                request_id=second.request_id,
+                user_id=123,
+            )
+        )
+        == ChatStreamStatus.RUNNING
+    )
+    _run_async(
+        chat_stream_manager.finish(
+            request_id=first.request_id,
+            status=ChatStreamStatus.CANCELLED,
+        )
+    )
+    _run_async(
+        chat_stream_manager.finish(
+            request_id=second.request_id,
+            status=ChatStreamStatus.CANCELLED,
+        )
+    )
+
+
+def test_chat_stream_create_waits_for_previous_conversation_task_cancel() -> None:
+    manager = ChatStreamManager()
+
+    async def scenario() -> None:
+        first = await manager.create(
+            user_id=123,
+            conversation_id="same-conversation",
+        )
+
+        async def wait_until_cancelled() -> None:
+            await asyncio.Event().wait()
+
+        task = asyncio.create_task(wait_until_cancelled())
+        await manager.set_task(request_id=first.request_id, task=task)
+
+        second = await manager.create(
+            user_id=123,
+            conversation_id="same-conversation",
+        )
+
+        assert task.done()
+        assert task.cancelled()
+        assert first.request_id != second.request_id
+        await manager.finish(
+            request_id=first.request_id,
+            status=ChatStreamStatus.CANCELLED,
+        )
+        await manager.finish(
+            request_id=second.request_id,
+            status=ChatStreamStatus.CANCELLED,
+        )
+
+    _run_async(scenario())
 
 
 def test_chat_cancel_running_request_is_idempotent(

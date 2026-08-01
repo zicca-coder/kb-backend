@@ -47,6 +47,7 @@ class UnavailableOpenClawClient:
         agent_id: str,
         openclaw_user: str,
         message: str,
+        session_key: str | None = None,
     ) -> OpenClawChatResult:
         raise OpenClawConfigurationError(self.message)
 
@@ -56,6 +57,7 @@ class UnavailableOpenClawClient:
         agent_id: str,
         openclaw_user: str,
         message: str,
+        session_key: str | None = None,
     ) -> AsyncIterator[str]:
         raise OpenClawConfigurationError(self.message)
         yield

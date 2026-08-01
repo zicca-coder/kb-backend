@@ -179,6 +179,7 @@ def client(
             agent_id: str,
             openclaw_user: str,
             message: str,
+            session_key: str | None = None,
         ) -> AsyncIterator[str]:
             yield "测试回答"
 

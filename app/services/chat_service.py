@@ -1,7 +1,8 @@
 import logging
-from time import perf_counter
 from dataclasses import dataclass
+from time import perf_counter
 from typing import AsyncIterator, Protocol
+from uuid import uuid4
 
 from fastapi import status
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -41,6 +42,7 @@ class ChatClient(Protocol):
         agent_id: str,
         openclaw_user: str,
         message: str,
+        session_key: str | None = None,
     ) -> OpenClawChatResult:
         ...
 
@@ -50,6 +52,7 @@ class ChatClient(Protocol):
         agent_id: str,
         openclaw_user: str,
         message: str,
+        session_key: str | None = None,
     ) -> AsyncIterator[str]:
         ...
 
@@ -72,6 +75,7 @@ class PreparedChatRequest:
     agent_id: str
     openclaw_user: str
     message: str
+    session_key: str
 
 
 class ChatService:
@@ -90,6 +94,8 @@ class ChatService:
         *,
         user_id: int,
         message: str,
+        conversation_id: str | None = None,
+        request_id: str | None = None,
     ) -> PreparedChatRequest:
         logger.debug(
             "聊天请求准备开始，user_id=%s, message_length=%s",
@@ -184,6 +190,10 @@ class ChatService:
             agent_id=agent_id,
             openclaw_user=str(user_id),
             message=message,
+            session_key=self._chat_session_key(
+                conversation_id=conversation_id,
+                request_id=request_id,
+            ),
         )
 
     async def chat_for_user(
@@ -191,10 +201,12 @@ class ChatService:
         *,
         user_id: int,
         message: str,
+        conversation_id: str | None = None,
     ) -> ChatResult:
         prepared = await self.prepare_chat_for_user(
             user_id=user_id,
             message=message,
+            conversation_id=conversation_id,
         )
 
         logger.info(
@@ -215,6 +227,7 @@ class ChatService:
                 agent_id=prepared.agent_id,
                 openclaw_user=prepared.openclaw_user,
                 message=prepared.message,
+                session_key=prepared.session_key,
             )
         except OpenClawRuntimeNotReadyError as exc:
             await self._mark_runtime_not_ready(user_id=user_id)
@@ -274,6 +287,7 @@ class ChatService:
                 agent_id=prepared.agent_id,
                 openclaw_user=prepared.openclaw_user,
                 message=prepared.message,
+                session_key=prepared.session_key,
             ):
                 logger.debug(
                     "流式聊天收到OpenClaw增量，user_id=%s, agent_id=%s, "
@@ -375,6 +389,18 @@ class ChatService:
         ):
             return status_value
         return ProvisionStatus.WARMING
+
+    @staticmethod
+    def _chat_session_key(
+        *,
+        conversation_id: str | None,
+        request_id: str | None,
+    ) -> str:
+        if conversation_id is not None:
+            return f"webchat:{conversation_id}"
+        if request_id is not None:
+            return f"webchat:{request_id}"
+        return f"webchat:{uuid4()}"
 
     async def _mark_runtime_not_ready(self, *, user_id: int) -> None:
         await self._update_agent_status(

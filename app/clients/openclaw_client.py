@@ -158,29 +158,28 @@ class OpenClawClient:
         agent_id: str,
         openclaw_user: str,
         message: str,
+        session_key: str | None = None,
     ) -> OpenClawChatResult:
         normalized_agent_id = self._normalize_agent_id(agent_id)
         normalized_openclaw_user = self._normalize_openclaw_user(
             openclaw_user,
         )
         normalized_message = self._normalize_chat_message(message)
-        payload = {
-            "model": f"openclaw/{normalized_agent_id}",
-            "user": normalized_openclaw_user,
-            "messages": [
-                {
-                    "role": "user",
-                    "content": normalized_message,
-                }
-            ],
-            "stream": False,
-        }
+        normalized_session_key = self._normalize_session_key(session_key)
+        payload = self._chat_payload(
+            agent_id=normalized_agent_id,
+            openclaw_user=normalized_openclaw_user,
+            message=normalized_message,
+            stream=False,
+        )
 
         try:
             if self._http_client is not None:
                 response = await self._http_client.post(
                     self._chat_request_url(),
-                    headers=self._auth_headers(),
+                    headers=self._chat_headers(
+                        session_key=normalized_session_key,
+                    ),
                     json=payload,
                     timeout=self._timeout,
                 )
@@ -191,7 +190,9 @@ class OpenClawClient:
                 ) as client:
                     response = await client.post(
                         CHAT_COMPLETIONS_PATH,
-                        headers=self._auth_headers(),
+                        headers=self._chat_headers(
+                            session_key=normalized_session_key,
+                        ),
                         json=payload,
                     )
         except httpx.TimeoutException as exc:
@@ -225,12 +226,14 @@ class OpenClawClient:
         agent_id: str,
         openclaw_user: str,
         message: str,
+        session_key: str | None = None,
     ) -> AsyncIterator[str]:
         normalized_agent_id = self._normalize_agent_id(agent_id)
         normalized_openclaw_user = self._normalize_openclaw_user(
             openclaw_user,
         )
         normalized_message = self._normalize_chat_message(message)
+        normalized_session_key = self._normalize_session_key(session_key)
         payload = self._chat_payload(
             agent_id=normalized_agent_id,
             openclaw_user=normalized_openclaw_user,
@@ -243,7 +246,9 @@ class OpenClawClient:
                 async with self._http_client.stream(
                     "POST",
                     self._chat_request_url(),
-                    headers=self._auth_headers(),
+                    headers=self._chat_headers(
+                        session_key=normalized_session_key,
+                    ),
                     json=payload,
                     timeout=self._timeout,
                 ) as response:
@@ -261,7 +266,9 @@ class OpenClawClient:
                     async with client.stream(
                         "POST",
                         CHAT_COMPLETIONS_PATH,
-                        headers=self._auth_headers(),
+                        headers=self._chat_headers(
+                            session_key=normalized_session_key,
+                        ),
                         json=payload,
                     ) as response:
                         await self._raise_stream_chat_status(
@@ -480,6 +487,12 @@ class OpenClawClient:
     def _auth_headers(self) -> dict[str, str]:
         return {"Authorization": f"Bearer {self._gateway_token}"}
 
+    def _chat_headers(self, *, session_key: str | None) -> dict[str, str]:
+        headers = self._auth_headers()
+        if session_key is not None:
+            headers["x-openclaw-session-key"] = session_key
+        return headers
+
     @staticmethod
     def _chat_payload(
         *,
@@ -499,6 +512,25 @@ class OpenClawClient:
             ],
             "stream": stream,
         }
+
+    @staticmethod
+    def _normalize_session_key(session_key: str | None) -> str | None:
+        if session_key is None:
+            return None
+        if not isinstance(session_key, str):
+            raise OpenClawRequestError(
+                "session_key must be a non-empty string",
+            )
+        normalized = session_key.strip()
+        if not normalized:
+            raise OpenClawRequestError(
+                "session_key must be a non-empty string",
+            )
+        if "\r" in normalized or "\n" in normalized:
+            raise OpenClawRequestError(
+                "session_key must not contain newlines",
+            )
+        return normalized
 
     def _raise_for_status(
         self,
