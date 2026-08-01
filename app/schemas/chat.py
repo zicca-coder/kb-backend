@@ -10,9 +10,13 @@ ConversationId = Annotated[
     str,
     StringConstraints(
         strip_whitespace=True,
-        min_length=1,
-        max_length=128,
-        pattern=r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$",
+        min_length=36,
+        max_length=36,
+        pattern=(
+            r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-"
+            r"[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
+            r"[0-9a-fA-F]{12}$"
+        ),
     ),
 ]
 

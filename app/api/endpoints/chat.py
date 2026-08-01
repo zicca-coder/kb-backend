@@ -8,6 +8,7 @@ from fastapi import APIRouter, Request
 from fastapi.responses import StreamingResponse
 
 from app.api.dependencies import ChatServiceDependency, CurrentUser
+from app.core.conversations import ConversationMessageStatus
 from app.core.errors import AppError
 from app.schemas.chat import ChatCancelResponse, ChatRequest, ChatResponse
 from app.schemas.response import ApiResponse, success_response
@@ -32,6 +33,7 @@ CHAT_STREAM_HEADERS = {
 class StreamQueueItem:
     kind: Literal["delta", "error", "done"]
     content: str | None = None
+    internal_error: str | None = None
 
 
 @router.post("", response_model=ApiResponse[ChatResponse])
@@ -157,6 +159,7 @@ async def _chat_event_stream(
                 )
                 if record_cancelled == ChatStreamStatus.CANCELLING:
                     return
+                answer_parts.append(delta)
                 await queue.put(StreamQueueItem("delta", delta))
         except asyncio.CancelledError:
             raise
@@ -166,18 +169,32 @@ async def _chat_event_stream(
                 request_id,
                 exc.code,
             )
-            await queue.put(StreamQueueItem("error", exc.message))
+            await queue.put(
+                StreamQueueItem(
+                    "error",
+                    exc.message,
+                    internal_error=f"{exc.code}: {exc.message}",
+                )
+            )
         except Exception as exc:
             logger.exception(
                 "Unexpected chat stream failure, request_id=%s",
                 request_id,
                 exc_info=exc,
             )
-            await queue.put(StreamQueueItem("error", "OpenClaw 服务异常"))
+            await queue.put(
+                StreamQueueItem(
+                    "error",
+                    "OpenClaw 服务异常",
+                    internal_error=type(exc).__name__,
+                )
+            )
         finally:
             with suppress(asyncio.CancelledError):
                 await queue.put(StreamQueueItem("done"))
 
+    answer_parts: list[str] = []
+    final_error_message: str | None = None
     producer = asyncio.create_task(produce())
     await chat_stream_manager.set_task(
         request_id=request_id,
@@ -255,6 +272,7 @@ async def _chat_event_stream(
 
             if item.kind == "error":
                 stream_status = ChatStreamStatus.FAILED
+                final_error_message = item.internal_error or item.content
                 logger.debug(
                     "流式聊天准备发送error事件，request_id=%s",
                     request_id,
@@ -314,3 +332,21 @@ async def _chat_event_stream(
             request_id=request_id,
             status=stream_status,
         )
+        final_status = {
+            ChatStreamStatus.COMPLETED: ConversationMessageStatus.COMPLETED,
+            ChatStreamStatus.CANCELLED: ConversationMessageStatus.CANCELLED,
+            ChatStreamStatus.FAILED: ConversationMessageStatus.ERROR,
+        }[stream_status]
+        try:
+            await service.finalize_streamed_chat(
+                prepared=prepared,
+                content="".join(answer_parts),
+                status=final_status,
+                error_message=final_error_message,
+            )
+        except Exception as exc:
+            logger.exception(
+                "Failed to persist chat stream final state, request_id=%s",
+                request_id,
+                exc_info=exc,
+            )

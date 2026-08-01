@@ -2,6 +2,7 @@ import asyncio
 import json
 from typing import AsyncIterator
 
+import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -15,8 +16,10 @@ from app.core.errors import (
     OpenClawResponseError,
     OpenClawRuntimeNotReadyError,
     OpenClawTimeoutError,
+    ResourceConflictError,
 )
 from app.models.user_agent import UserAgent
+from app.models.conversation_message import ConversationMessage
 from app.schemas.openclaw import (
     AgentProvisionResult,
     AgentRuntimeEnsureReadyResult,
@@ -149,6 +152,22 @@ def _authorization(token: str) -> dict[str, str]:
     return {"Authorization": f"Bearer {token}"}
 
 
+def _create_conversation(
+    client: TestClient,
+    *,
+    token: str,
+    title: str | None = None,
+) -> str:
+    payload = {} if title is None else {"title": title}
+    response = client.post(
+        "/api/conversations",
+        headers=_authorization(token),
+        json=payload,
+    )
+    assert response.status_code == 200
+    return response.json()["data"]["id"]
+
+
 def _run_async(awaitable):
     return asyncio.run(awaitable)
 
@@ -236,18 +255,19 @@ def test_chat_uses_conversation_id_as_openclaw_session_key(
         provision_status="ready",
     )
     token = _login(client, username="chat_conversation")
+    conversation_id = _create_conversation(client, token=token)
 
     response = client.post(
         CHAT_URL,
         headers=_authorization(token),
-        json={"message": "你好", "conversation_id": "conv-123"},
+        json={"message": "你好", "conversation_id": conversation_id},
     )
 
     assert response.status_code == 200
     assert openclaw_client.chat_calls == [
         ("web-user-conversation", str(user["id"]), "你好")
     ]
-    assert openclaw_client.chat_session_keys == ["webchat:conv-123"]
+    assert openclaw_client.chat_session_keys == [f"webchat:{conversation_id}"]
 
 
 def test_chat_stream_false_keeps_sync_response_structure(
@@ -355,6 +375,7 @@ def test_chat_stream_uses_conversation_id_as_openclaw_session_key(
         provision_status="ready",
     )
     token = _login(client, username="chat_stream_conversation")
+    conversation_id = _create_conversation(client, token=token)
 
     response = client.post(
         CHAT_URL,
@@ -362,7 +383,7 @@ def test_chat_stream_uses_conversation_id_as_openclaw_session_key(
         json={
             "message": "你好",
             "stream": True,
-            "conversation_id": "conv-stream-123",
+            "conversation_id": conversation_id,
         },
     )
 
@@ -371,7 +392,7 @@ def test_chat_stream_uses_conversation_id_as_openclaw_session_key(
         ("web-user-stream-conversation", str(user["id"]), "你好")
     ]
     assert openclaw_client.stream_session_keys == [
-        "webchat:conv-stream-123"
+        f"webchat:{conversation_id}"
     ]
 
 
@@ -463,27 +484,20 @@ def test_chat_stream_create_cancels_previous_same_conversation() -> None:
             conversation_id="same-conversation",
         )
     )
-    second = _run_async(
-        chat_stream_manager.create(
-            user_id=123,
-            conversation_id="same-conversation",
-        )
-    )
 
-    assert first.request_id != second.request_id
+    async def create_second() -> None:
+        with pytest.raises(ResourceConflictError):
+            await chat_stream_manager.create(
+                user_id=123,
+                conversation_id="same-conversation",
+            )
+
+    _run_async(create_second())
+
     assert (
         _run_async(
             chat_stream_manager.get_status_for_user(
                 request_id=first.request_id,
-                user_id=123,
-            )
-        )
-        == ChatStreamStatus.CANCELLING
-    )
-    assert (
-        _run_async(
-            chat_stream_manager.get_status_for_user(
-                request_id=second.request_id,
                 user_id=123,
             )
         )
@@ -492,12 +506,6 @@ def test_chat_stream_create_cancels_previous_same_conversation() -> None:
     _run_async(
         chat_stream_manager.finish(
             request_id=first.request_id,
-            status=ChatStreamStatus.CANCELLED,
-        )
-    )
-    _run_async(
-        chat_stream_manager.finish(
-            request_id=second.request_id,
             status=ChatStreamStatus.CANCELLED,
         )
     )
@@ -518,20 +526,16 @@ def test_chat_stream_create_waits_for_previous_conversation_task_cancel() -> Non
         task = asyncio.create_task(wait_until_cancelled())
         await manager.set_task(request_id=first.request_id, task=task)
 
-        second = await manager.create(
-            user_id=123,
-            conversation_id="same-conversation",
-        )
+        with pytest.raises(ResourceConflictError):
+            await manager.create(
+                user_id=123,
+                conversation_id="same-conversation",
+            )
 
-        assert task.done()
-        assert task.cancelled()
-        assert first.request_id != second.request_id
+        assert not task.done()
+        task.cancel()
         await manager.finish(
             request_id=first.request_id,
-            status=ChatStreamStatus.CANCELLED,
-        )
-        await manager.finish(
-            request_id=second.request_id,
             status=ChatStreamStatus.CANCELLED,
         )
 

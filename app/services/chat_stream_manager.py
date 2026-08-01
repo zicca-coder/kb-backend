@@ -5,7 +5,7 @@ from dataclasses import dataclass, field
 from enum import StrEnum
 from uuid import uuid4
 
-from app.core.errors import ResourceNotFoundError
+from app.core.errors import ResourceConflictError, ResourceNotFoundError
 
 
 class ChatStreamStatus(StrEnum):
@@ -53,16 +53,17 @@ class ChatStreamManager:
         user_id: int,
         conversation_id: str | None = None,
     ) -> ChatStreamRecord:
-        tasks_to_await: list[asyncio.Task[None]] = []
         async with self._lock:
             self._purge_terminal_locked()
             if conversation_id is not None:
-                tasks_to_await = (
-                    self._cancel_matching_conversation_locked(
-                        user_id=user_id,
-                        conversation_id=conversation_id,
+                if self._has_running_conversation_locked(
+                    user_id=user_id,
+                    conversation_id=conversation_id,
+                ):
+                    raise ResourceConflictError(
+                        code="chat_stream_conflict",
+                        message="当前会话已有生成请求进行中",
                     )
-                )
             request_id = str(uuid4())
             record = ChatStreamRecord(
                 request_id=request_id,
@@ -70,10 +71,6 @@ class ChatStreamManager:
                 conversation_id=conversation_id,
             )
             self._records[request_id] = record
-
-        for task in tasks_to_await:
-            with suppress(asyncio.CancelledError):
-                await task
 
         return record
 
@@ -187,13 +184,12 @@ class ChatStreamManager:
         for request_id in oldest_ids:
             self._terminal_records.pop(request_id, None)
 
-    def _cancel_matching_conversation_locked(
+    def _has_running_conversation_locked(
         self,
         *,
         user_id: int,
         conversation_id: str,
-    ) -> list[asyncio.Task[None]]:
-        tasks_to_await: list[asyncio.Task[None]] = []
+    ) -> bool:
         for record in self._records.values():
             if (
                 record.user_id != user_id
@@ -201,13 +197,8 @@ class ChatStreamManager:
                 or record.status in TERMINAL_STATUSES
             ):
                 continue
-            record.status = ChatStreamStatus.CANCELLING
-            record.cancel_event.set()
-            if record.task is not None and not record.task.done():
-                record.task.cancel()
-                tasks_to_await.append(record.task)
-            record.updated_at = time.monotonic()
-        return tasks_to_await
+            return True
+        return False
 
 
 chat_stream_manager = ChatStreamManager()

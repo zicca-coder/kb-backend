@@ -18,6 +18,7 @@ from app.services.agent_provision_service import (
 )
 from app.services.auth_service import AuthService
 from app.services.chat_service import ChatService
+from app.services.conversation_service import ConversationService
 from app.services.user_agent_service import UserAgentService
 from app.services.user_service import UserService
 from app.schemas.openclaw import (
@@ -157,6 +158,18 @@ ChatServiceDependency = Annotated[
 ]
 
 
+async def get_conversation_service(
+    db: DatabaseDependency,
+) -> ConversationService:
+    return ConversationService(db)
+
+
+ConversationServiceDependency = Annotated[
+    ConversationService,
+    Depends(get_conversation_service),
+]
+
+
 def _invalid_authentication_error() -> AuthenticationError:
     return AuthenticationError(
         code="invalid_token",
@@ -203,6 +216,7 @@ CurrentUser = Annotated[User, Depends(get_current_user)]
 __all__ = [
     "AuthServiceDependency",
     "ChatServiceDependency",
+    "ConversationServiceDependency",
     "CurrentUser",
     "DatabaseDependency",
     "AgentProvisioningServiceDependency",

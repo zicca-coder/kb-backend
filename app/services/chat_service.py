@@ -7,6 +7,7 @@ from uuid import uuid4
 from fastapi import status
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.conversations import ConversationMessageStatus
 from app.core.errors import (
     AppError,
     OpenClawAuthenticationError,
@@ -25,11 +26,13 @@ from app.core.provisioning import (
     DEFAULT_AGENT_RETRY_AFTER_MS,
     ProvisionStatus,
 )
+from app.repository.conversation_repository import ConversationRepository
 from app.repository.user_agent_repository import UserAgentRepository
 from app.schemas.openclaw import (
     AgentRuntimeEnsureReadyResult,
     OpenClawChatResult,
 )
+from app.services.conversation_service import ConversationService
 
 logger = logging.getLogger("uvicorn.error")
 CHAT_ANSWER_LOG_PREVIEW_CHARS = 2000
@@ -76,6 +79,8 @@ class PreparedChatRequest:
     openclaw_user: str
     message: str
     session_key: str
+    conversation_id: str | None = None
+    assistant_message_id: int | None = None
 
 
 class ChatService:
@@ -84,10 +89,18 @@ class ChatService:
         db: AsyncSession,
         openclaw_client: ChatClient,
         repository: UserAgentRepository | None = None,
+        conversation_service: ConversationService | None = None,
     ) -> None:
         self.db = db
         self.openclaw_client = openclaw_client
         self.repository = repository or UserAgentRepository(db)
+        self.conversation_service = (
+            conversation_service
+            or ConversationService(
+                db,
+                repository=ConversationRepository(db),
+            )
+        )
 
     async def prepare_chat_for_user(
         self,
@@ -180,6 +193,21 @@ class ChatService:
                 agent_id=agent_id,
             )
 
+        assistant_message_id: int | None = None
+        if conversation_id is not None:
+            pair = await self.conversation_service.create_chat_message_pair(
+                user_id=user_id,
+                conversation_id=conversation_id,
+                user_content=message,
+                request_id=request_id,
+                assistant_status=(
+                    ConversationMessageStatus.STREAMING
+                    if request_id is not None
+                    else ConversationMessageStatus.PENDING
+                ),
+            )
+            assistant_message_id = pair.assistant_message.id
+
         logger.debug(
             "聊天请求准备完成，user_id=%s, agent_id=%s",
             user_id,
@@ -194,6 +222,8 @@ class ChatService:
                 conversation_id=conversation_id,
                 request_id=request_id,
             ),
+            conversation_id=conversation_id,
+            assistant_message_id=assistant_message_id,
         )
 
     async def chat_for_user(
@@ -230,6 +260,10 @@ class ChatService:
                 session_key=prepared.session_key,
             )
         except OpenClawRuntimeNotReadyError as exc:
+            await self._finalize_prepared_error(
+                prepared=prepared,
+                error_message="agent_runtime_not_ready",
+            )
             await self._mark_runtime_not_ready(user_id=user_id)
             raise AppError(
                 code="agent_runtime_not_ready",
@@ -242,11 +276,20 @@ class ChatService:
                 },
             ) from exc
         except OpenClawError as exc:
-            raise self._map_openclaw_error(
+            mapped = self._map_openclaw_error(
                 exc,
                 agent_id=prepared.agent_id,
-            ) from exc
+            )
+            await self._finalize_prepared_error(
+                prepared=prepared,
+                error_message=f"{mapped.code}: {mapped.message}",
+            )
+            raise mapped from exc
 
+        await self._finalize_prepared_completed(
+            prepared=prepared,
+            answer=result.answer,
+        )
         logger.info(
             "OpenClaw chat response, user_id=%s, agent_id=%s, "
             "elapsed_ms=%s, answer_length=%s, answer_preview=%r",
@@ -310,10 +353,57 @@ class ChatService:
                 },
             ) from exc
         except OpenClawError as exc:
-            raise self._map_openclaw_error(
+            mapped = self._map_openclaw_error(
                 exc,
                 agent_id=prepared.agent_id,
-            ) from exc
+            )
+            raise mapped from exc
+
+    async def finalize_streamed_chat(
+        self,
+        *,
+        prepared: PreparedChatRequest,
+        content: str,
+        status: ConversationMessageStatus,
+        error_message: str | None = None,
+    ) -> None:
+        if prepared.assistant_message_id is None:
+            return
+        await self.conversation_service.finalize_assistant_message(
+            assistant_message_id=prepared.assistant_message_id,
+            content=content,
+            status=status,
+            error_message=error_message,
+        )
+
+    async def _finalize_prepared_completed(
+        self,
+        *,
+        prepared: PreparedChatRequest,
+        answer: str,
+    ) -> None:
+        if prepared.assistant_message_id is None:
+            return
+        await self.conversation_service.finalize_assistant_message(
+            assistant_message_id=prepared.assistant_message_id,
+            content=answer,
+            status=ConversationMessageStatus.COMPLETED,
+        )
+
+    async def _finalize_prepared_error(
+        self,
+        *,
+        prepared: PreparedChatRequest,
+        error_message: str,
+    ) -> None:
+        if prepared.assistant_message_id is None:
+            return
+        await self.conversation_service.finalize_assistant_message(
+            assistant_message_id=prepared.assistant_message_id,
+            content="",
+            status=ConversationMessageStatus.ERROR,
+            error_message=error_message,
+        )
 
     async def _ensure_agent_ready(
         self,

@@ -61,6 +61,41 @@ CREATE TABLE user_agents (
 )
 """
 
+CONVERSATION_SCHEMA = """
+CREATE TABLE conversations (
+    id VARCHAR(36) PRIMARY KEY,
+    user_id BIGINT NOT NULL,
+    title VARCHAR(100) NOT NULL DEFAULT '新对话',
+    status VARCHAR(32) NOT NULL DEFAULT 'active',
+    last_message_at DATETIME,
+    is_deleted BOOLEAN NOT NULL DEFAULT 0,
+    created_by VARCHAR(64) NOT NULL DEFAULT 'system',
+    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_by VARCHAR(64) NOT NULL DEFAULT 'system',
+    updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (user_id) REFERENCES users(id)
+)
+"""
+
+CONVERSATION_MESSAGE_SCHEMA = """
+CREATE TABLE conversation_messages (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    conversation_id VARCHAR(36) NOT NULL,
+    role VARCHAR(32) NOT NULL,
+    content TEXT NOT NULL DEFAULT '',
+    status VARCHAR(32) NOT NULL DEFAULT 'pending',
+    request_id VARCHAR(36),
+    sequence_no INTEGER NOT NULL,
+    error_message VARCHAR(1000),
+    created_by VARCHAR(64) NOT NULL DEFAULT 'system',
+    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_by VARCHAR(64) NOT NULL DEFAULT 'system',
+    updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (conversation_id) REFERENCES conversations(id),
+    UNIQUE (conversation_id, sequence_no)
+)
+"""
+
 
 @pytest.fixture(scope="session")
 def test_database_path(tmp_path_factory) -> Path:
@@ -75,6 +110,20 @@ def test_engine(test_database_path: Path):
     with engine.begin() as connection:
         connection.execute(text(TEST_SCHEMA))
         connection.execute(text(USER_AGENT_SCHEMA))
+        connection.execute(text(CONVERSATION_SCHEMA))
+        connection.execute(text(CONVERSATION_MESSAGE_SCHEMA))
+        connection.execute(
+            text(
+                "CREATE INDEX ix_conversations_user_deleted_last_message "
+                "ON conversations (user_id, is_deleted, last_message_at)"
+            )
+        )
+        connection.execute(
+            text(
+                "CREATE INDEX ix_conversation_messages_conversation_sequence "
+                "ON conversation_messages (conversation_id, sequence_no)"
+            )
+        )
     try:
         yield engine
     finally:
@@ -105,10 +154,14 @@ def async_session_factory(
 @pytest.fixture(autouse=True)
 def clean_database(test_engine) -> Generator[None, None, None]:
     with test_engine.begin() as connection:
+        connection.execute(text("DELETE FROM conversation_messages"))
+        connection.execute(text("DELETE FROM conversations"))
         connection.execute(text("DELETE FROM user_agents"))
         connection.execute(text("DELETE FROM users"))
     yield
     with test_engine.begin() as connection:
+        connection.execute(text("DELETE FROM conversation_messages"))
+        connection.execute(text("DELETE FROM conversations"))
         connection.execute(text("DELETE FROM user_agents"))
         connection.execute(text("DELETE FROM users"))
 
